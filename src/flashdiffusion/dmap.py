@@ -60,10 +60,11 @@ class DiffusionMap:
         self.tile         = tile
 
         # set after fit()
-        self.X_:       Optional[np.ndarray] = None
-        self.rscale_:  Optional[np.ndarray] = None
-        self.D_:       Optional[np.ndarray] = None
-        self.D_alpha_: Optional[np.ndarray] = None
+        self.X_:          Optional[np.ndarray] = None
+        self.rscale_:     Optional[np.ndarray] = None
+        self.D_:          Optional[np.ndarray] = None
+        self.D_alpha_:    Optional[np.ndarray] = None
+        self._cuda_state: Optional[object]     = None  # CUDAState if GPU used
 
         # set after transform()
         self.eigenvalues_:  Optional[np.ndarray] = None
@@ -78,13 +79,8 @@ class DiffusionMap:
         """
         Precompute Coifman-Lafon normalisation for dataset X.
 
-        Two passes of prepass_rowsum:
-          Pass 1  weights = 1         -> D_i  = Σⱼ K(i,j)
-          Pass 2  weights = D^{-α}   -> (Σⱼ K(i,j) w_j) · w_i = D_alpha_i
-
-        rscale = D_alpha^{-1/2} · D^{-α}   is the combined diagonal that
-        reduces the matvec to:
-          (M v)_i = rscale_i · Σⱼ K(i,j) · rscale_j · v_j
+        Uses CUDA backend (two GPU prepass kernels) if available,
+        otherwise numpy CPU fallback. Either way the interface is identical.
         """
         N = X.shape[0]
         self.X_ = X.astype(np.float64)
@@ -93,43 +89,49 @@ class DiffusionMap:
         print(f"[DiffusionMap.fit] N={N}  beta={beta}  alpha={alpha}")
         t0 = time.perf_counter()
 
-        # pass 1: raw row sums
+        # Try CUDA first
+        from .kernel import _get_cuda_backend
+        cuda = _get_cuda_backend()
+        if cuda is not None:
+            from .kernel_cuda import precompute_cuda
+            self._cuda_state = precompute_cuda(X, beta, alpha)
+            # Mirror numpy fields from GPU tensors for CDC / Doob / Nyström
+            self.D_       = self._cuda_state.D.cpu().numpy().astype(np.float64)
+            self.D_alpha_ = self._cuda_state.D_alpha.cpu().numpy().astype(np.float64)
+            self.rscale_  = self._cuda_state.rscale.cpu().numpy().astype(np.float64)
+            print(f"  precompute done (CUDA) in {time.perf_counter()-t0:.3f}s")
+            return self
+
+        # Numpy fallback
+        self._cuda_state = None
         D = prepass_rowsum(X, X, beta,
                            weights_k=np.ones(N, np.float64), tile=tile)
         self.D_ = D
         w = D ** (-alpha)
-
-        # pass 2: alpha-corrected row sums
-        # D_alpha_i = (Σⱼ K(i,j) · w_j) · w_i
         D_alpha = prepass_rowsum(X, X, beta, weights_k=w, tile=tile) * w
         self.D_alpha_ = D_alpha
-
         d_half = D_alpha ** (-0.5)
-        self.rscale_ = d_half * w          # combined: D_alpha^{-1/2} · D^{-α}
-
-        print(f"  precompute done in {time.perf_counter()-t0:.3f}s")
+        self.rscale_ = d_half * w
+        print(f"  precompute done (numpy) in {time.perf_counter()-t0:.3f}s")
         return self
-
-    # ------------------------------------------------------------------
-    # matvec: single FlashDiffusion call — used by eigensolver
-    # ------------------------------------------------------------------
 
     def matvec(self, v: np.ndarray) -> np.ndarray:
         """
-        Apply symmetrised diffusion operator M to a single vector v (N,).
-        Called on every Lanczos/LOBPCG iteration.
+        Apply M to v. Uses CUDA kernel if available, numpy otherwise.
+        Called every Lanczos iteration — v is the only thing that changes.
         """
         self._check_fitted()
+
+        if self._cuda_state is not None:
+            from .kernel_cuda import matvec_cuda
+            return matvec_cuda(self._cuda_state, v)
+
+        # numpy path
         v2d = v.reshape(-1, 1)
         out = FlashDiffusion(
-            Q        = self.X_,
-            K        = self.X_,
-            V        = v2d,
-            beta     = self.beta,
-            rscale_q = self.rscale_,
-            rscale_k = self.rscale_,
-            h        = None,
-            tile     = self.tile,
+            Q=self.X_, K=self.X_, V=v2d, beta=self.beta,
+            rscale_q=self.rscale_, rscale_k=self.rscale_,
+            tile=self.tile,
         )
         return out.ravel()
 
