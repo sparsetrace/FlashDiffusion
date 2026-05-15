@@ -1,555 +1,182 @@
 """
 flashdiffusion/kernel.py
 ========================
+The FlashDiffusion primitive.
 
-FlashDiffusion: the O(N) memory diffusion kernel primitive for PyTorch.
+FlashDiffusion(Q, K, V, beta, alpha, h, rscale_q, rscale_k, tile)
 
-    out = FlashDiffusion(Q, K, V, alpha, beta, h, log_d_q, log_d_k)
+Computes, tile by tile, without materialising the O(N²) kernel matrix:
 
-Computes the generalised DMAP Markov operator applied to V:
+    score(i,j)   = beta * ||q_i - k_j||²              (Gaussian, default)
+                 | score_mod(q_i, k_j)                 (custom, future)
 
-    out_i = sum_j P_ij V_j
+    K(i,j)       = exp(-score(i,j))
 
-where P is constructed via FlexAttention with a custom score_mod:
+    out_i        = rscale_q_i · Σⱼ K(i,j) · rscale_k_j · (h_j · v_j)
 
-    s_ij  =  -beta * ||q_i - k_j||^2          (Gaussian kernel)
-             - alpha * (log_d_q[i] + log_d_k[j])   (density correction)
-             + log_h[i] - log_h[j]             (Doob h-transform)
+where rscale_{q,k} encode the Coifman-Lafon normalisation and h is an
+optional Doob potential (default h=1, no transform).
 
-The row-softmax inside FlexAttention IS the Markov normalisation —
-no additional division is needed after the kernel call.
-
-Connection to DAC (arXiv:2603.28037):
---------------------------------------
-FlashDiffusion is the EQ sector of attention (P+):
-  alpha=0,  h=None   ->  raw kernel (no density correction)
-  alpha=1,  h=None   ->  Laplace-Beltrami DMAP (Coifman-Lafon 2006)
-  alpha=0.5,h=None   ->  Fokker-Planck normalisation
-  alpha=1,  h!=None  ->  Doob h-transform of DMAP
-                          (tilted Markov operator, Schrodinger bridge)
-
-The LSE (log-sum-exp) returned alongside the output equals
-log(sum_j K_alpha_ij) -- used to estimate densities for a second
-normalisation pass. See dmap.py for the two-pass DMAP pipeline.
-
-Validated against dense DMAP to fp32 accuracy (~1e-7 max error).
-
-Usage
+Modes
 -----
-# single call: get P+ V
-out = FlashDiffusion(X, X, V, alpha=1.0, beta=0.5, log_d_q=lse1, log_d_k=lse1)
+DMAP matvec    Q=K=X,  rscale_q=rscale_k=rscale (precomputed by DiffusionMap)
+AMAP matvec    Q≠K,    rscale_q/k separate (directed/NESS operator, DAC §3)
+Doob mode      h ≠ 1:  h-transform of either operator (DAC §4, Theorem 5.1)
+Prepass        V=1 (or V=w), h=1: computes row sums D or D_alpha
 
-# with density estimation (returns LSE alongside output)
-out, lse = FlashDiffusion(..., return_lse=True)
+Complexity
+----------
+Arithmetic : O(N_q · N_k · d)   — same as dense, unavoidable
+Memory     : O((N_q + N_k) · tile)  — never O(N²)
 
-# Doob h-transform
-out = FlashDiffusion(..., h=h_potential)
-
-Requirements
-------------
-torch >= 2.5  (flex_attention + AuxRequest available)
-CUDA GPU recommended; CPU supported but uncompiled (slow, for debugging).
+Current backend: NumPy (CPU reference).
+CUDA target:     CuTe SM90, fused prepass+matvec, tensor-core GEMM for
+                 the xi·xj term, elementwise exp epilogue. No online
+                 softmax needed — rscale is precomputed.
 """
 
 from __future__ import annotations
-
-import warnings
+import numpy as np
 from typing import Optional
 
-import torch
-import torch.nn as nn
-from torch.nn.attention.flex_attention import flex_attention
 
-# ── Try to import AuxRequest (PyTorch >= 2.5).
-# Older builds use the deprecated return_lse=True keyword instead.
-try:
-    from torch.nn.attention.flex_attention import AuxRequest
-    _HAS_AUX_REQUEST = True
-except ImportError:
-    _HAS_AUX_REQUEST = False
+# ---------------------------------------------------------------------------
+# Distance tile  (shared by prepass and matvec)
+# ---------------------------------------------------------------------------
 
-# ── Compiled flex_attention (avoid materialising the full N×N matrix).
-# torch.compile is a no-op on CPU, so this is safe cross-device.
-_flex_compiled = torch.compile(flex_attention, dynamic=True)
+def _dist2_tile(
+    Qi: np.ndarray,   # (ti, d)  float32
+    Kj: np.ndarray,   # (tj, d)  float32
+    sqi: np.ndarray,  # (ti,)
+    sqk: np.ndarray,  # (tj,)
+) -> np.ndarray:
+    """Squared Euclidean distances for one (Q-tile, K-tile) pair. float64 output."""
+    d2 = sqi[:, None] + sqk[None, :] - 2.0 * (Qi @ Kj.T)
+    np.maximum(d2, 0.0, out=d2)
+    return d2.astype(np.float64)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Bandwidth estimation
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Prepass: row-sum reduction  (used twice in precompute_normalization)
+# ---------------------------------------------------------------------------
 
-def estimate_beta(
-    X: torch.Tensor,
-    n_sub: int = 2000,
-) -> float:
+def prepass_rowsum(
+    Q: np.ndarray,            # (N_q, d)
+    K: np.ndarray,            # (N_k, d)
+    beta: float,
+    weights_k: Optional[np.ndarray] = None,   # (N_k,)  default = 1
+    tile: int = 512,
+) -> np.ndarray:
     """
-    Estimate the DMAP kernel bandwidth:
+    out_i = Σⱼ exp(-beta · ||q_i - k_j||²) · weights_k_j
 
-        beta = 1 / (2 * median(||xi - xj||^2))
-
-    Uses random subsampling for large N to keep cost O(n_sub^2 * D).
-
-    Parameters
-    ----------
-    X     : (N, D)  data matrix
-    n_sub : int     subsample size for median estimation
-
-    Returns
-    -------
-    beta : float
+    Returns (N_q,) float64.
+    This is the primitive used for both normalisation passes:
+      pass 1:  weights_k = np.ones(N)   -> D_i  (raw row sums)
+      pass 2:  weights_k = w = D^{-α}  -> D_alpha_i (before * w_i)
     """
-    N = X.shape[0]
-    idx   = torch.randperm(N, device=X.device)[:min(n_sub, N)]
-    X_sub = X[idx].float()                       # always fp32 for stability
-    D2    = torch.cdist(X_sub, X_sub).pow(2)
-    med   = D2[D2 > 0].median()
-    return (1.0 / (2.0 * med)).item()
+    N_q, d = Q.shape
+    N_k    = K.shape[0]
+    if weights_k is None:
+        weights_k = np.ones(N_k, dtype=np.float64)
 
+    Q32 = Q.astype(np.float32)
+    K32 = K.astype(np.float32)
+    sqQ = (Q32 * Q32).sum(axis=1)
+    sqK = (K32 * K32).sum(axis=1)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# score_mod factory
-# ──────────────────────────────────────────────────────────────────────────────
+    out = np.zeros(N_q, dtype=np.float64)
 
-def make_score_mod(
-    q_norm2:  torch.Tensor,                   # (N,)  ||q_i||^2
-    k_norm2:  torch.Tensor,                   # (N,)  ||k_j||^2
-    beta:     float,
-    log_d_q:  Optional[torch.Tensor] = None,  # (N,)  log density at queries
-    log_d_k:  Optional[torch.Tensor] = None,  # (N,)  log density at keys
-    alpha:    float = 0.0,
-    log_h_q:  Optional[torch.Tensor] = None,  # (N,)  log Doob potential (query)
-    log_h_k:  Optional[torch.Tensor] = None,  # (N,)  log Doob potential (key)
-):
-    """
-    Build the FlexAttention score_mod for the DMAP kernel.
+    for i0 in range(0, N_q, tile):
+        i1  = min(i0 + tile, N_q)
+        Qi  = Q32[i0:i1]
+        sqi = sqQ[i0:i1]
 
-    The score at position (i, j) is modified from the raw dot product
-    q_i . k_j  to:
+        for j0 in range(0, N_k, tile):
+            j1  = min(j0 + tile, N_k)
+            Kj  = K32[j0:j1]
+            sqk = sqK[j0:j1]
 
-        s_ij  =  2*beta*(q_i . k_j)
-                - beta * (||q_i||^2 + ||k_j||^2)    <- completes -beta||qi-kj||^2
-                - alpha * (log_d_q[i] + log_d_k[j]) <- density correction
-                + log_h_q[i] - log_h_k[j]           <- Doob tilt (optional)
+            d2      = _dist2_tile(Qi, Kj, sqi, sqk)
+            K_tile  = np.exp(-beta * d2)              # (ti, tj)
+            out[i0:i1] += K_tile @ weights_k[j0:j1]
 
-    After FlexAttention applies row-softmax to these scores, the result is
-    the Markov operator P (or its Doob tilt) applied to V:
-
-        out_i = sum_j softmax(s_ij) * V_j  =  (P V)_i
-
-    Note: norm tensors are cast to fp32 inside score_mod regardless of the
-    dtype of Q and K, avoiding the catastrophic cancellation that would
-    occur in bf16 for close points.
-
-    Parameters
-    ----------
-    q_norm2, k_norm2 : (N,)   squared norms of Q and K rows
-    beta             : float  kernel bandwidth
-    log_d_q, log_d_k : (N,)  log densities for alpha-normalisation
-                              (pass None to skip density correction)
-    alpha            : float  density normalisation exponent
-    log_h_q, log_h_k : (N,)  log Doob potential at query / key points
-                              (pass None to skip Doob transform)
-
-    Returns
-    -------
-    score_mod : callable  compatible with flex_attention(score_mod=...)
-    """
-    # ── Keep all auxiliary tensors in fp32 regardless of input dtype.
-    # FlexAttention's score computation runs inside the kernel in fp32
-    # accumulators, but the score_mod closure executes at the input dtype
-    # unless we explicitly cast. Norm terms involve cancellation (||q||^2
-    # is subtracted from 2*q.k) which needs fp32 to avoid ~1e-2 bf16 errors.
-    _qn  = q_norm2.float()
-    _kn  = k_norm2.float()
-
-    _zero = torch.zeros(1, device=q_norm2.device)
-
-    _log_dq = log_d_q.float() if log_d_q is not None else None
-    _log_dk = log_d_k.float() if log_d_k is not None else None
-    _log_hq = log_h_q.float() if log_h_q is not None else None
-    _log_hk = log_h_k.float() if log_h_k is not None else None
-
-    _beta  = float(beta)
-    _alpha = float(alpha)
-
-    def score_mod(score, b, h, qi, ki):
-        # score  = q_i . k_j  (raw dot product, scale=1.0 bypasses 1/sqrt(d))
-        # Cast to fp32 for precision in the cancellation computation.
-        s = _beta * (2.0 * score.float() - _qn[qi] - _kn[ki])
-
-        if _log_dq is not None and _alpha != 0.0:
-            s = s - _alpha * (_log_dq[qi] + _log_dk[ki])
-
-        if _log_hq is not None:
-            # Doob: multiply score by h_i / h_j = exp(log_h_i - log_h_j)
-            # Adding log_h_i and subtracting log_h_j in score space.
-            s = s + _log_hq[qi] - _log_hk[ki]
-
-        return s.to(score.dtype)
-
-    return score_mod
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# _flex_call: thin wrapper handling the AuxRequest / return_lse API difference
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _flex_call(
-    Q4:         torch.Tensor,    # (1, 1, N, D)
-    K4:         torch.Tensor,    # (1, 1, N, D)
-    V4:         torch.Tensor,    # (1, 1, N, d)
-    score_mod,
-    compiled:   bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Call flex_attention and always return (out, lse).
-
-    Handles the API change between PyTorch versions:
-      >= 2.6: use return_aux=AuxRequest(lse=True)
-      <  2.6: use deprecated return_lse=True
-
-    Returns
-    -------
-    out : (1, 1, N, d)
-    lse : (1, 1, N)     log-sum-exp per query (= log sum_j exp(s_ij))
-    """
-    fn = _flex_compiled if compiled else flex_attention
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")   # suppress deprecation noise
-
-        if _HAS_AUX_REQUEST:
-            out, aux = fn(Q4, K4, V4,
-                          score_mod=score_mod,
-                          scale=1.0,
-                          return_aux=AuxRequest(lse=True))
-            lse = aux.lse
-        else:
-            out, lse = fn(Q4, K4, V4,
-                          score_mod=score_mod,
-                          scale=1.0,
-                          return_lse=True)
-
-    return out, lse
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FlashDiffusion  — the public primitive
-# ──────────────────────────────────────────────────────────────────────────────
-
-def FlashDiffusion(
-    Q:          torch.Tensor,                   # (N, D)  query points
-    K:          torch.Tensor,                   # (M, D)  key points  (= Q for DMAP)
-    V:          torch.Tensor,                   # (M, d)  values
-    alpha:      float = 1.0,
-    beta:       Optional[float] = None,
-    h:          Optional[torch.Tensor] = None,  # (N,)  Doob h-potential (>0)
-    log_d_q:    Optional[torch.Tensor] = None,  # (N,)  precomputed log density
-    log_d_k:    Optional[torch.Tensor] = None,  # (M,)  precomputed log density
-    return_lse: bool = False,
-    compiled:   bool = True,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """
-    FlashDiffusion: O(N) memory DMAP kernel evaluation via FlexAttention.
-
-    Computes:
-
-        out_i  =  sum_j  P_ij  V_j
-
-    where P is the (generalised) DMAP Markov operator:
-
-        P_ij  =  exp(s_ij) / sum_k exp(s_ik)
-
-        s_ij  =  -beta * ||q_i - k_j||^2
-                 - alpha * (log_d_q[i] + log_d_k[j])
-                 + log_h[i] - log_h[j]                 (if h given)
-
-    No N×M matrix is ever materialised. Memory is O(N + M + d).
-
-    Design
-    ------
-    The FlexAttention row-softmax IS the Markov normalisation.
-    After a single call with the correct score_mod, the output is already
-    the Markov operator applied to V — no additional division is needed.
-
-    For the standard two-pass DMAP pipeline (Coifman-Lafon):
-
-        # Pass 1: raw density  d_i = sum_j K(q_i, k_j)
-        _, lse1 = FlashDiffusion(Q, K, ones, alpha=0, beta=beta, return_lse=True)
-        log_d = lse1                     # (N,)  log sum_j K_ij
-
-        # Pass 2: P+ V  with alpha-normalised kernel
-        out = FlashDiffusion(Q, K, V, alpha=1.0, beta=beta,
-                             log_d_q=log_d, log_d_k=log_d)
-
-    Connection to DAC (arXiv:2603.28037)
-    -------------------------------------
-    FlashDiffusion implements the EQ sector of attention:
-      Q = K = X (self-attention)  ->  DMAP diffusion operator P+
-      alpha = 0                   ->  graph Laplacian kernel (no density)
-      alpha = 1                   ->  Laplace-Beltrami (Coifman-Lafon)
-      h != None                   ->  Doob h-transform (Schrodinger bridge)
-
-    Parameters
-    ----------
-    Q         : (N, D)  query points
-    K         : (M, D)  key points  (pass K=Q for standard DMAP)
-    V         : (M, d)  values to weighted-sum (eigenvectors, ones, etc.)
-    alpha     : float   density normalisation exponent
-                          0   = no correction
-                          0.5 = Fokker-Planck
-                          1.0 = Laplace-Beltrami (default)
-    beta      : float   kernel bandwidth  1/(2*sigma^2);
-                        auto-estimated from Q if None
-    h         : (N,)    Doob h-potential (strictly positive);
-                        implements the tilted operator diag(h) P diag(1/h)
-    log_d_q   : (N,)    log density at query points (from a prior density pass);
-                        pass None to skip density correction regardless of alpha
-    log_d_k   : (M,)    log density at key points
-    return_lse: bool    if True, also return log-sum-exp per query row
-                        (= log sum_j exp(s_ij), used for density estimation)
-    compiled  : bool    use torch.compile(flex_attention) for fused kernel;
-                        set False for CPU debugging
-
-    Returns
-    -------
-    out : (N, d)
-        Weighted sum: out_i = sum_j P_ij V_j
-
-    lse : (N,)   [only if return_lse=True]
-        Log-sum-exp: lse_i = log sum_j exp(s_ij)
-        Equivalently: lse = log(row sums of un-normalised kernel)
-        Used to obtain the density estimate d_i = exp(lse_i).
-    """
-    N, D = Q.shape
-    M    = K.shape[0]
-
-    # ── bandwidth auto-estimation ─────────────────────────────────────────
-    if beta is None:
-        beta = estimate_beta(Q)
-
-    # ── squared norms (fp32 for precision in score_mod) ───────────────────
-    q_norm2 = (Q * Q).sum(-1)    # (N,)
-    k_norm2 = (K * K).sum(-1)    # (M,)
-
-    # ── Doob potential in log space ────────────────────────────────────────
-    log_h_q: Optional[torch.Tensor] = None
-    log_h_k: Optional[torch.Tensor] = None
-    if h is not None:
-        if h.shape[0] != N:
-            raise ValueError(
-                f"h must have length N={N}, got {h.shape[0]}"
-            )
-        log_h_q = h.log()
-        log_h_k = h.log()   # for self-attention Q=K so same h applies to both
-
-    # ── consistency checks ─────────────────────────────────────────────────
-    if log_d_q is not None and log_d_q.shape[0] != N:
-        raise ValueError(f"log_d_q must have length N={N}")
-    if log_d_k is not None and log_d_k.shape[0] != M:
-        raise ValueError(f"log_d_k must have length M={M}")
-    if V.shape[0] != M:
-        raise ValueError(f"V must have M={M} rows to match K")
-
-    # ── build score_mod ────────────────────────────────────────────────────
-    score_mod = make_score_mod(
-        q_norm2  = q_norm2,
-        k_norm2  = k_norm2,
-        beta     = beta,
-        log_d_q  = log_d_q,
-        log_d_k  = log_d_k,
-        alpha    = alpha,
-        log_h_q  = log_h_q,
-        log_h_k  = log_h_k,
-    )
-
-    # ── reshape to (B=1, H=1, N, D) for FlexAttention ─────────────────────
-    Q4 = Q.unsqueeze(0).unsqueeze(0)    # (1, 1, N, D)
-    K4 = K.unsqueeze(0).unsqueeze(0)    # (1, 1, M, D)
-    V4 = V.unsqueeze(0).unsqueeze(0)    # (1, 1, M, d)
-
-    # ── kernel call ────────────────────────────────────────────────────────
-    out4, lse4 = _flex_call(Q4, K4, V4, score_mod, compiled=compiled)
-
-    # ── squeeze batch / head dims ──────────────────────────────────────────
-    out = out4.squeeze(0).squeeze(0)    # (N, d)
-    lse = lse4.squeeze(0).squeeze(0)    # (N,)
-
-    if return_lse:
-        return out, lse
     return out
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Density estimation utility  (single-pass via return_lse)
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Matvec: the core FlashDiffusion kernel
+# ---------------------------------------------------------------------------
 
-def estimate_log_density(
-    Q:       torch.Tensor,          # (N, D)
-    K:       torch.Tensor,          # (M, D)
-    beta:    float,
-    alpha:   float = 0.0,
-    log_d_q: Optional[torch.Tensor] = None,
-    log_d_k: Optional[torch.Tensor] = None,
-    compiled: bool = True,
-) -> torch.Tensor:
+def FlashDiffusion(
+    Q:         np.ndarray,                   # (N_q, d)
+    K:         np.ndarray,                   # (N_k, d)
+    V:         np.ndarray,                   # (N_k, r)  r columns
+    beta:      float,
+    rscale_q:  Optional[np.ndarray] = None,  # (N_q,)  default = 1
+    rscale_k:  Optional[np.ndarray] = None,  # (N_k,)  default = 1
+    h:         Optional[np.ndarray] = None,  # (N_k,)  Doob potential, default = 1
+    tile:      int = 512,
+) -> np.ndarray:
     """
-    Estimate log density at query points Q using the kernel over K:
+    FlashDiffusion(Q, K, V, beta, rscale_q, rscale_k, h, tile)
 
-        log_d_i  =  log sum_j exp( -beta * ||q_i - k_j||^2
-                                   - alpha*(log_d_q[i] + log_d_k[j]) )
-
-    Implemented as a single FlashDiffusion call with V = ones, returning LSE.
-
-    For a two-pass DMAP pipeline:
-
-        # Pass 1: raw density (alpha=0)
-        log_d1 = estimate_log_density(X, X, beta, alpha=0.0)
-
-        # Pass 2: density after alpha-normalisation
-        log_d2 = estimate_log_density(X, X, beta, alpha=1.0,
-                                      log_d_q=log_d1, log_d_k=log_d1)
+    out_i = rscale_q_i · Σⱼ exp(-beta·||qᵢ-kⱼ||²) · rscale_k_j · h_j · v_j
 
     Parameters
     ----------
-    Q, K     : point clouds
-    beta     : bandwidth
-    alpha    : density correction exponent (0 for first pass)
-    log_d_q, log_d_k : prior density estimates (None for first pass)
+    Q, K   : coordinate matrices (may be identical for DMAP)
+    V      : (N_k, r) right-hand side vectors
+    beta   : kernel bandwidth
+    rscale_q, rscale_k : Coifman-Lafon normalisation diagonals
+                         set both to precomputed rscale for DMAP
+    h      : Doob h-transform potential (optional)
+    tile   : tile size controlling peak SMEM / GMEM traffic
 
     Returns
     -------
-    log_d : (N,)   log sum_j K_alpha(q_i, k_j)
+    out : (N_q, r) float64
+
+    Notes
+    -----
+    - No online softmax: rscale is precomputed, epilogue is a scalar multiply.
+    - Tile loop is embarrassingly parallel — maps directly to CuTe thread blocks.
+    - For the CUDA kernel: dist2 tile is a GEMM + diagonal bias; exp is the
+      epilogue; accumulation is plain float32 register tile (no max tracking).
     """
-    N = Q.shape[0]
-    M = K.shape[0]
-    ones = torch.ones(M, 1, device=Q.device, dtype=Q.dtype)
+    N_q, d = Q.shape
+    N_k, r = V.shape
 
-    _, lse = FlashDiffusion(
-        Q, K, ones,
-        alpha    = alpha,
-        beta     = beta,
-        log_d_q  = log_d_q,
-        log_d_k  = log_d_k,
-        return_lse = True,
-        compiled   = compiled,
-    )
-    return lse    # (N,)
+    Q32 = Q.astype(np.float32)
+    K32 = K.astype(np.float32)
+    sqQ = (Q32 * Q32).sum(axis=1)
+    sqK = (K32 * K32).sum(axis=1)
 
+    # pre-scale the RHS:  u_j = rscale_k_j · h_j · v_j
+    u = V.astype(np.float64)
+    if rscale_k is not None:
+        u = rscale_k[:, None] * u
+    if h is not None:
+        u = h[:, None] * u
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Convenience: FlashDiffusion as a torch.nn.Module
-# (useful for torch.compile / torch.export workflows)
-# ──────────────────────────────────────────────────────────────────────────────
+    out = np.zeros((N_q, r), dtype=np.float64)
 
-class FlashDiffusionModule(nn.Module):
-    """
-    nn.Module wrapper around FlashDiffusion for integration into
-    PyTorch model pipelines (compile, export, DDP, etc.).
+    for i0 in range(0, N_q, tile):
+        i1  = min(i0 + tile, N_q)
+        Qi  = Q32[i0:i1]
+        sqi = sqQ[i0:i1]
 
-    Parameters
-    ----------
-    alpha    : float   density normalisation exponent (default 1.0)
-    beta     : float   bandwidth (estimated at first forward call if None)
-    compiled : bool    use torch.compile internally
-    """
+        for j0 in range(0, N_k, tile):
+            j1  = min(j0 + tile, N_k)
+            Kj  = K32[j0:j1]
+            sqk = sqK[j0:j1]
 
-    def __init__(
-        self,
-        alpha:    float = 1.0,
-        beta:     Optional[float] = None,
-        compiled: bool = True,
-    ):
-        super().__init__()
-        self.alpha    = alpha
-        self.beta     = beta
-        self.compiled = compiled
-        self._beta_estimated: Optional[float] = None
-        self._log_d_cache: Optional[torch.Tensor] = None
+            d2     = _dist2_tile(Qi, Kj, sqi, sqk)
+            K_tile = np.exp(-beta * d2)               # (ti, tj) — epilogue
+            out[i0:i1] += K_tile @ u[j0:j1]           # accumulate
 
-    def forward(
-        self,
-        Q:          torch.Tensor,
-        K:          torch.Tensor,
-        V:          torch.Tensor,
-        h:          Optional[torch.Tensor] = None,
-        log_d_q:    Optional[torch.Tensor] = None,
-        log_d_k:    Optional[torch.Tensor] = None,
-        return_lse: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        beta = self.beta or self._beta_estimated
-        if beta is None:
-            beta = estimate_beta(Q)
-            self._beta_estimated = beta
-        return FlashDiffusion(
-            Q, K, V,
-            alpha      = self.alpha,
-            beta       = beta,
-            h          = h,
-            log_d_q    = log_d_q,
-            log_d_k    = log_d_k,
-            return_lse = return_lse,
-            compiled   = self.compiled,
-        )
+    # post-scale by rscale_q
+    if rscale_q is not None:
+        out *= rscale_q[:, None]
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Quick self-test (run as python kernel.py)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _selftest():
-    import sys
-    torch.manual_seed(42)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype  = torch.float32
-    print(f"FlashDiffusion self-test  device={device}  dtype={dtype}")
-
-    N, D, d = 128, 16, 8
-    X = torch.randn(N, D, device=device, dtype=dtype)
-    V = torch.randn(N, d, device=device, dtype=dtype)
-    beta = estimate_beta(X)
-    print(f"  N={N}  D={D}  d={d}  beta={beta:.5f}")
-
-    # ── Dense reference ──────────────────────────────────────────────────
-    D2   = torch.cdist(X.float(), X.float()).pow(2)
-    Kraw = torch.exp(-beta * D2)
-    d1   = Kraw.sum(1)
-    Ka   = Kraw / torch.outer(d1, d1)
-    d2   = Ka.sum(1)
-    P    = Ka / d2.unsqueeze(1)
-    ref  = (P @ V.float()).to(dtype)
-
-    # ── Pass 1: density ───────────────────────────────────────────────────
-    log_d1 = estimate_log_density(X, X, beta, alpha=0.0, compiled=False)
-    err_d1 = (log_d1 - d1.log()).abs().max().item()
-    print(f"  Pass 1 density error : {err_d1:.2e}  (target < 1e-5)")
-
-    # ── Pass 2: P+ V ──────────────────────────────────────────────────────
-    out = FlashDiffusion(X, X, V, alpha=1.0, beta=beta,
-                         log_d_q=log_d1, log_d_k=log_d1, compiled=False)
-    err_pv = (out - ref).abs().max().item()
-    print(f"  P+ V error           : {err_pv:.2e}  (target < 1e-5)")
-
-    # ── Doob h-transform ─────────────────────────────────────────────────
-    h = torch.rand(N, device=device, dtype=dtype).abs() + 0.1
-    P_doob_unnorm = torch.outer(h.float(), 1.0/h.float()) * P
-    P_doob = P_doob_unnorm / P_doob_unnorm.sum(1, keepdim=True)
-    ref_doob = (P_doob @ V.float()).to(dtype)
-    out_doob = FlashDiffusion(X, X, V, alpha=1.0, beta=beta,
-                              h=h, log_d_q=log_d1, log_d_k=log_d1,
-                              compiled=False)
-    err_doob = (out_doob - ref_doob).abs().max().item()
-    print(f"  Doob h-transform err : {err_doob:.2e}  (target < 1e-5)")
-
-    # ── Module interface ─────────────────────────────────────────────────
-    mod = FlashDiffusionModule(alpha=1.0, beta=beta, compiled=False)
-    out_mod = mod(X, X, V, log_d_q=log_d1, log_d_k=log_d1)
-    err_mod = (out_mod - ref).abs().max().item()
-    print(f"  Module interface err : {err_mod:.2e}  (target < 1e-5)")
-
-    passed = all(e < 1e-4 for e in [err_d1, err_pv, err_doob, err_mod])
-    print(f"\n  {'PASSED' if passed else 'FAILED'}")
-    sys.exit(0 if passed else 1)
-
-
-if __name__ == "__main__":
-    _selftest()
+    return out
