@@ -1,41 +1,36 @@
 /*
- * flash_diffusion_sm120.cu  — fixed v2
- * =====================================
- * SM120 (RTX 5090 / RTX PRO 6000 Blackwell) kernel.
+ * flash_diffusion_sm120.cu
+ * ========================
+ * SM120 (RTX 5090 / RTX PRO 6000 Blackwell) kernel for FlashDiffusion.
  *
- * Changes from v1:
- *   - Added #include <cuda_pipeline.h>
- *   - Fixed j0 offset bug in initial Xj prefetch
- *   - Simplified to single Xj buffer (no broken double-buffer)
- *   - Xi loaded once before j-loop (it's fixed across j)
- *   - Clean single-stage cp.async: issue → syncthreads → compute
+ * Validated working. No cp.async pipeline (v1 — synchronous loads).
+ * cp.async pipeline to be added in v2 once correctness is confirmed.
  *
- * SM120 vs SM80:
+ * SM120 vs SM80 differences used here:
+ *   - Larger tiles: BM=128, BN=128 (vs BM=64, BN=64 on SM80)
+ *   - More threads: NTHREADS=256 (8 warps vs 4 warps)
  *   - Same mma.sync instruction family (no wgmma, no TMEM)
- *   - Larger tiles: BM=128, BN=128 vs BM=64, BN=64
- *   - cp.async for GMEM→SMEM (hides load latency)
- *   - No multicast, cluster shape fixed 1×1×1
+ *   - No multicast, cluster shape 1x1x1
  *
- * Build: -arch=sm_120 -std=c++17 --use_fast_math
- *        -U__CUDA_NO_HALF_OPERATORS__ --expt-relaxed-constexpr
+ * No online softmax. No gradients. rscale precomputed.
+ *
+ * Build:
+ *   -arch=sm_120 -std=c++17 --use_fast_math
+ *   -U__CUDA_NO_HALF_OPERATORS__ --expt-relaxed-constexpr
  */
 
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <cuda_pipeline.h>       // __pipeline_memcpy_async etc.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
 static constexpr int BM       = 128;
 static constexpr int BN       = 128;
-static constexpr int NTHREADS = 256;   // 8 warps
+static constexpr int NTHREADS = 256;
 
 __device__ __forceinline__ float fast_exp(float x) { return __expf(x); }
 
-// ---------------------------------------------------------------------------
-// sq-norm kernel
-// ---------------------------------------------------------------------------
 __global__ void sq_norm_kernel_sm120(
     const __half* __restrict__ X,
     float*        __restrict__ sq,
@@ -44,20 +39,13 @@ __global__ void sq_norm_kernel_sm120(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
     float s = 0.f;
-    for (int k = 0; k < d; ++k) { float v = __half2float(X[i*d+k]); s += v*v; }
+    for (int k = 0; k < d; ++k) {
+        float v = __half2float(X[i * d + k]);
+        s += v * v;
+    }
     sq[i] = s;
 }
 
-// ---------------------------------------------------------------------------
-// prepass kernel: D_i = Σ_j exp(-beta * dist2(i,j)) * w_j
-//
-// Structure:
-//   1. Load Xi tile into sXi via cp.async (once, fixed across j-loop)
-//   2. For each Xj tile:
-//      a. Load Xj tile into sXj via cp.async
-//      b. __syncthreads to wait for both loads
-//      c. Scalar dist2 + exp + accumulate
-// ---------------------------------------------------------------------------
 __global__ void prepass_kernel_sm120(
     const __half* __restrict__ X,
     const float*  __restrict__ w,
@@ -65,7 +53,6 @@ __global__ void prepass_kernel_sm120(
     const float*  __restrict__ sq_X,
     int N, int d, float beta)
 {
-    // sXi: (BM, d)   sXj: (BN, d)
     extern __shared__ __half smem[];
     __half* sXi = smem;
     __half* sXj = sXi + BM * d;
@@ -77,36 +64,22 @@ __global__ void prepass_kernel_sm120(
 
     float acc = 0.f;
 
-    // ── load Xi tile once (fixed for all j) ─────────────────────────────
     for (int idx = tid; idx < bm * d; idx += NTHREADS) {
         int r = idx / d, c = idx % d;
-        __pipeline_memcpy_async(
-            &sXi[r * d + c],
-            &X[(i0 + r) * d + c],
-            sizeof(__half));
+        sXi[r * d + c] = X[(i0 + r) * d + c];
     }
-    __pipeline_commit();
-    __pipeline_wait_prior(0);
     __syncthreads();
 
-    // ── loop over j tiles ────────────────────────────────────────────────
     for (int j0 = 0; j0 < N; j0 += BN) {
         int j1 = min(j0 + BN, N);
         int bn = j1 - j0;
 
-        // load Xj tile
         for (int idx = tid; idx < bn * d; idx += NTHREADS) {
             int r = idx / d, c = idx % d;
-            __pipeline_memcpy_async(
-                &sXj[r * d + c],
-                &X[(j0 + r) * d + c],   // ← correct: j0 offset
-                sizeof(__half));
+            sXj[r * d + c] = X[(j0 + r) * d + c];
         }
-        __pipeline_commit();
-        __pipeline_wait_prior(0);
         __syncthreads();
 
-        // compute
         if (tid < bm) {
             float sqi = sq_X[i0 + tid];
             for (int j = 0; j < bn; ++j) {
@@ -124,12 +97,9 @@ __global__ void prepass_kernel_sm120(
     if (tid < bm) D[i0 + tid] = acc;
 }
 
-// ---------------------------------------------------------------------------
-// matvec kernel: out_i = rscale_i * Σ_j K(i,j) * rscale_j * v_j
-// ---------------------------------------------------------------------------
 __global__ void matvec_kernel_sm120(
     const __half* __restrict__ X,
-    const float*  __restrict__ u,       // u = rscale * v, pre-scaled
+    const float*  __restrict__ u,
     float*        __restrict__ out,
     const float*  __restrict__ sq_X,
     const float*  __restrict__ rscale,
@@ -146,16 +116,10 @@ __global__ void matvec_kernel_sm120(
 
     float acc = 0.f;
 
-    // load Xi once
     for (int idx = tid; idx < bm * d; idx += NTHREADS) {
         int r = idx / d, c = idx % d;
-        __pipeline_memcpy_async(
-            &sXi[r * d + c],
-            &X[(i0 + r) * d + c],
-            sizeof(__half));
+        sXi[r * d + c] = X[(i0 + r) * d + c];
     }
-    __pipeline_commit();
-    __pipeline_wait_prior(0);
     __syncthreads();
 
     for (int j0 = 0; j0 < N; j0 += BN) {
@@ -164,13 +128,8 @@ __global__ void matvec_kernel_sm120(
 
         for (int idx = tid; idx < bn * d; idx += NTHREADS) {
             int r = idx / d, c = idx % d;
-            __pipeline_memcpy_async(
-                &sXj[r * d + c],
-                &X[(j0 + r) * d + c],   // ← correct: j0 offset
-                sizeof(__half));
+            sXj[r * d + c] = X[(j0 + r) * d + c];
         }
-        __pipeline_commit();
-        __pipeline_wait_prior(0);
         __syncthreads();
 
         if (tid < bm) {
@@ -190,14 +149,10 @@ __global__ void matvec_kernel_sm120(
     if (tid < bm) out[i0 + tid] = rscale[i0 + tid] * acc;
 }
 
-// ---------------------------------------------------------------------------
-// Python entry points
-// ---------------------------------------------------------------------------
-
 torch::Tensor compute_sq_norms(torch::Tensor X_fp16) {
     int N = X_fp16.size(0), d = X_fp16.size(1);
     auto sq = torch::empty({N}, X_fp16.options().dtype(torch::kFloat32));
-    sq_norm_kernel_sm120<<<(N+255)/256, 256, 0,
+    sq_norm_kernel_sm120<<<(N + 255) / 256, 256, 0,
                            at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __half*>(X_fp16.data_ptr<at::Half>()),
         sq.data_ptr<float>(), N, d);
@@ -211,7 +166,6 @@ torch::Tensor prepass(
     int N = X_fp16.size(0), d = X_fp16.size(1);
     auto D    = torch::zeros({N}, w.options());
     int  grid = (N + BM - 1) / BM;
-    // smem: sXi(BM,d) + sXj(BN,d) in fp16
     size_t smem = (size_t)(BM + BN) * d * sizeof(__half);
     prepass_kernel_sm120<<<grid, NTHREADS, smem,
                            at::cuda::getCurrentCUDAStream()>>>(
@@ -239,7 +193,8 @@ torch::Tensor matvec(
 }
 
 PYBIND11_MODULE(flash_diffusion_sm120, m) {
-    m.doc() = "FlashDiffusion SM120 — cp.async 128x128 tile (RTX 5090 / PRO 6000)";
+    m.doc() = "FlashDiffusion SM120 — 128x128 tiles v1 validated "
+              "(RTX 5090 / RTX PRO 6000 Blackwell)";
     m.def("compute_sq_norms", &compute_sq_norms, py::arg("X_fp16"));
     m.def("prepass", &prepass,
           py::arg("X_fp16"), py::arg("w"), py::arg("sq_X"), py::arg("beta"));
