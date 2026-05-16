@@ -4,53 +4,41 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flashdiffusion"
-version = "0.0.2"
-description = "FlashDiffusion"
+version = "0.1.0"
+description = "FlashDiffusion: tiled memory-efficient diffusion maps eigensolver"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-
 authors = [
-  { name = "Your Name", email = "julio@sparsetrace.ai" }
+  { name = "Julio Candanedo", email = "julio@sparsetrace.ai" }
 ]
 
+# core deps — CPU-only install stays light
 dependencies = [
   "numpy>=1.24",
   "scipy>=1.10",
-  "torch>=2.5",
-  "einops>=0.7",
 ]
 
 [project.optional-dependencies]
+cuda = [
+  "torch>=2.1",
+  "ninja",           # ← here: optional dep for CUDA extension build
+]
 examples = [
   "matplotlib>=3.7",
-  "pandas>=2.0",
   "scikit-learn>=1.3",
   "jupyter>=1.0",
 ]
-
-cuda = [
-  "triton>=3.0",
-  "flash-attn>=2.5",
-]
-
-jax = [
-  "jax>=0.4.20",
-  "jaxlib>=0.4.20",
-]
-
 dev = [
   "pytest>=7.0",
   "ruff>=0.3.0",
   "black>=24.0",
 ]
-
 all = [
+  "torch>=2.1",
+  "ninja",
   "matplotlib>=3.7",
-  "pandas>=2.0",
   "scikit-learn>=1.3",
-  "jupyter>=1.0",
-  "triton>=3.0",
   "pytest>=7.0",
   "ruff>=0.3.0",
   "black>=24.0",
