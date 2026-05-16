@@ -195,7 +195,7 @@ __global__ void matvec_kernel_sm120(
         int bn = min(BN, N);
         for (int idx = tid; idx < bn * d; idx += NTHREADS) {
             int r = idx / d, c = idx % d;
-            __pipeline_memcpy_async(&sXj[r*d+c], &X[r*d+c], sizeof(__half));
+            __pipeline_memcpy_async(&sXj[r*d+c], &X[(j0+r)*d+c], sizeof(__half));
         }
         __pipeline_commit();
     }
