@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flashdiffusion"
-version = "0.0.1"
-description = "FlashDiffusion: RoPE-DMAP and fast diffusion-map operators with attention kernels"
+version = "0.0.2"
+description = "FlashDiffusion"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 
 authors = [
-  { name = "Your Name", email = "your.email@example.com" }
+  { name = "Your Name", email = "julio@sparsetrace.ai" }
 ]
 
 dependencies = [
