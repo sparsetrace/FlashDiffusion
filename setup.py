@@ -1,65 +1,128 @@
 """
 setup.py
 ========
-Builds all FlashDiffusion CUDA extensions.
+Builds FlashDiffusion CUDA extensions.
 
-  CPU only:
-    pip install -e .
+Three kernels in csrc/:
+  flash_diffusion_sm80.cu   — SM80 scalar (A100, RTX 3090/4090, H100 fallback)
+  flash_diffusion_sm90.cu   — SM90 wgmma+TMA (H100 native, requires CUTLASS)
+  flash_diffusion_sm120.cu  — SM120 cp.async 128x128 tile (RTX 5090)
 
-  GPU — auto-detects SM:
-    FLASHDIFFUSION_BUILD_CUDA=1 pip install -e ".[cuda]"
+Usage
+-----
+  # CPU only:
+  pip install -e .
 
-  GPU — specific arch:
-    FLASHDIFFUSION_BUILD_CUDA=1 TORCH_CUDA_ARCH_LIST="8.0 12.0" pip install -e ".[cuda]"
+  # GPU — auto-detects SM from current GPU:
+  FLASHDIFFUSION_BUILD_CUDA=1 pip install -e ".[cuda]"
+
+  # specific arch:
+  FLASHDIFFUSION_BUILD_CUDA=1 TORCH_CUDA_ARCH_LIST="8.0" pip install -e ".[cuda]"
+  FLASHDIFFUSION_BUILD_CUDA=1 TORCH_CUDA_ARCH_LIST="9.0" pip install -e ".[cuda]"
+  FLASHDIFFUSION_BUILD_CUDA=1 TORCH_CUDA_ARCH_LIST="12.0" pip install -e ".[cuda]"
+
+  # multiple arches:
+  FLASHDIFFUSION_BUILD_CUDA=1 TORCH_CUDA_ARCH_LIST="8.0 9.0 12.0" pip install -e ".[cuda]"
+
+SM90 note
+---------
+  Requires CUTLASS >= 3.5.1 headers for wgmma atoms.
+  Set CUTLASS_PATH env var, or add as git submodule:
+    git submodule add https://github.com/NVIDIA/cutlass third_party/cutlass
+    git submodule update --init --depth=1
 """
 
 import os, sys, glob
 from setuptools import setup
 
+
 def find_cuda_includes():
+    """Find CUDA headers from nvidia pip packages or system CUDA."""
     py = f"python{sys.version_info.major}.{sys.version_info.minor}"
     candidates = []
+
     cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if cuda_home:
         candidates.append(os.path.join(cuda_home, "include"))
+
     for base in [
         f"/usr/local/lib/{py}/site-packages/nvidia",
         f"/usr/lib/{py}/site-packages/nvidia",
     ]:
         candidates += glob.glob(f"{base}/*/include")
-    candidates += ["/usr/local/cuda/include"]
+
+    candidates += ["/usr/local/cuda/include", "/usr/cuda/include"]
+
     return [p for p in candidates
             if os.path.isdir(p) and
             any(os.path.exists(os.path.join(p, h))
                 for h in ["cuda_runtime.h", "cusparse.h", "cublas.h"])]
 
 
-# SM → source file mapping
+def find_cutlass_include():
+    """Find CUTLASS headers. Required for SM90 wgmma kernel."""
+    # env var
+    env = os.environ.get("CUTLASS_PATH", "")
+    if env and os.path.isdir(env):
+        return env
+    # git submodule
+    sub = os.path.join(os.path.dirname(__file__),
+                       "third_party", "cutlass", "include")
+    if os.path.isdir(sub):
+        return sub
+    # notebook builds clone here
+    if os.path.isdir("/tmp/cutlass/include"):
+        return "/tmp/cutlass/include"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# SM routing tables
+# ---------------------------------------------------------------------------
+
 _SM_SOURCES = {
     "80":  "src/flashdiffusion/csrc/flash_diffusion_sm80.cu",
-    "86":  "src/flashdiffusion/csrc/flash_diffusion_sm80.cu",   # RTX 3090 etc
-    "89":  "src/flashdiffusion/csrc/flash_diffusion_sm80.cu",   # RTX 4090
-    "90":  "src/flashdiffusion/csrc/flash_diffusion_sm80.cu",   # H100 fallback until sm90 written
-    "120": "src/flashdiffusion/csrc/flash_diffusion_sm120.cu",
-    "121": "src/flashdiffusion/csrc/flash_diffusion_sm120.cu",  # DGX Spark
-    "100": "src/flashdiffusion/csrc/flash_diffusion_sm80.cu",   # B200 fallback until sm100 written
+    "86":  "src/flashdiffusion/csrc/flash_diffusion_sm80.cu",
+    "89":  "src/flashdiffusion/csrc/flash_diffusion_sm80.cu",
+    "90":  "src/flashdiffusion/csrc/flash_diffusion_sm90.cu",   # H100 native
+    "100": "src/flashdiffusion/csrc/flash_diffusion_sm80.cu",   # B200 fallback
     "103": "src/flashdiffusion/csrc/flash_diffusion_sm80.cu",   # B300 fallback
+    "120": "src/flashdiffusion/csrc/flash_diffusion_sm120.cu",  # RTX 5090
+    "121": "src/flashdiffusion/csrc/flash_diffusion_sm120.cu",  # DGX Spark
 }
 
-# SM → module name (pybind11 PYBIND11_MODULE name must match)
 _SM_MODULE = {
     "80":  "flash_diffusion_cuda",
     "86":  "flash_diffusion_cuda",
     "89":  "flash_diffusion_cuda",
-    "90":  "flash_diffusion_cuda",
-    "120": "flash_diffusion_sm120",
-    "121": "flash_diffusion_sm120",
+    "90":  "flash_diffusion_sm90",    # pybind11 module name in .cu
     "100": "flash_diffusion_cuda",
     "103": "flash_diffusion_cuda",
+    "120": "flash_diffusion_sm120",
+    "121": "flash_diffusion_sm120",
 }
 
-BUILD_CUDA = os.environ.get("FLASHDIFFUSION_BUILD_CUDA", "0") == "1"
+# SM90 requires sm_90a (architecture-accelerated) for wgmma.
+# All other SMs use plain sm_NN.
+_SM_ARCH = {
+    "80": "sm_80", "86": "sm_86", "89": "sm_89",
+    "90": "sm_90a",   # ← 'a' is critical — wgmma won't work without it
+    "100": "sm_100", "103": "sm_103",
+    "120": "sm_120", "121": "sm_121",
+}
 
+
+def _gencode(sm):
+    arch    = _SM_ARCH.get(sm, f"sm_{sm}")
+    compute = arch.replace("sm_", "compute_")
+    return f"-gencode=arch={compute},code={arch}"
+
+
+# ---------------------------------------------------------------------------
+# Extension build
+# ---------------------------------------------------------------------------
+
+BUILD_CUDA = os.environ.get("FLASHDIFFUSION_BUILD_CUDA", "0") == "1"
 ext_modules = []
 cmdclass    = {}
 
@@ -68,31 +131,57 @@ if BUILD_CUDA:
         import torch
         from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 
-        cuda_includes = find_cuda_includes()
-        print(f"[setup.py] CUDA includes: {cuda_includes}")
+        cuda_includes   = find_cuda_includes()
+        cutlass_include = find_cutlass_include()
 
-        # auto-detect arch from GPU if not set
+        print(f"[setup.py] CUDA includes : {cuda_includes}")
+        print(f"[setup.py] CUTLASS       : {cutlass_include or 'NOT FOUND'}")
+
+        # resolve arch list
         arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
         if not arch_list:
             try:
                 major, minor = torch.cuda.get_device_capability()
                 arch_list = f"{major}.{minor}"
+                print(f"[setup.py] auto-detected: SM{major*10+minor} "
+                      f"({torch.cuda.get_device_name(0)})")
             except Exception:
                 arch_list = "8.0"
-        print(f"[setup.py] building for arch: {arch_list}")
+                print("[setup.py] no GPU found, defaulting to 8.0")
 
-        # group archs by module name to avoid duplicate extensions
-        module_to_archs: dict[str, list[str]] = {}
-        module_to_source: dict[str, str]      = {}
-        for a in arch_list.replace("+PTX", "").split():
-            sm = a.strip().replace(".", "")
+        # normalise: "8.0 9.0+PTX" → ["80", "90"]
+        sms = [a.strip().replace(".", "").replace("+PTX", "")
+               for a in arch_list.split() if a.strip()]
+
+        # group by (module, source) to avoid duplicate extensions
+        groups: dict[tuple[str, str], list[str]] = {}
+        for sm in sms:
             mod = _SM_MODULE.get(sm, "flash_diffusion_cuda")
             src = _SM_SOURCES.get(sm, _SM_SOURCES["80"])
-            module_to_archs.setdefault(mod, []).append(sm)
-            module_to_source[mod] = src  # last one wins (same file anyway)
+            groups.setdefault((mod, src), []).append(sm)
 
-        for mod, sms in module_to_archs.items():
-            gencode = [f"-gencode=arch=compute_{sm},code=sm_{sm}" for sm in sms]
+        for (mod, src), sm_list in groups.items():
+            if not os.path.exists(src):
+                print(f"[setup.py] SKIP {mod}: {src} not found in repo")
+                continue
+
+            needs_cutlass = any(sm == "90" for sm in sm_list)
+            if needs_cutlass and cutlass_include is None:
+                print(f"[setup.py] SKIP {mod} (SM90): CUTLASS not found. "
+                      f"Set CUTLASS_PATH or add third_party/cutlass submodule.")
+                continue
+
+            includes = cuda_includes[:]
+            if needs_cutlass:
+                includes = [cutlass_include] + includes
+
+            nvcc_extra = []
+            if needs_cutlass:
+                nvcc_extra = [
+                    "-DCUTLASS_ARCH_MMA_SM90_SUPPORTED=1",
+                    "-DCUTE_ARCH_MMA_SM90A_ENABLED=1",
+                ]
+
             nvcc_flags = [
                 "-std=c++17", "-O3", "--use_fast_math",
                 "-U__CUDA_NO_HALF_OPERATORS__",
@@ -100,18 +189,15 @@ if BUILD_CUDA:
                 "-U__CUDA_NO_HALF2_OPERATORS__",
                 "--expt-relaxed-constexpr",
                 "--expt-extended-lambda",
-            ] + gencode
+            ] + [_gencode(sm) for sm in sm_list] + nvcc_extra
 
-            src = module_to_source[mod]
-            if not os.path.exists(src):
-                print(f"[setup.py] skipping {mod} — {src} not found")
-                continue
+            print(f"[setup.py] building {mod}  SM{sm_list}  "
+                  f"arch={[_SM_ARCH.get(s, s) for s in sm_list]}")
 
-            print(f"[setup.py] building {mod} from {src} for SM{sms}")
             ext_modules.append(CUDAExtension(
                 name    = mod,
                 sources = [src],
-                include_dirs = cuda_includes,
+                include_dirs = includes,
                 extra_compile_args = {
                     "cxx":  ["-std=c++17", "-O3"],
                     "nvcc": nvcc_flags,
@@ -122,19 +208,31 @@ if BUILD_CUDA:
         print(f"[setup.py] {len(ext_modules)} extension(s) configured.")
 
     except ImportError as e:
-        print(f"[setup.py] skipping CUDA: {e}")
+        print(f"[setup.py] torch not available, skipping CUDA: {e}")
+    except Exception as e:
+        print(f"[setup.py] CUDA setup error: {e}")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Package metadata
+# ---------------------------------------------------------------------------
 
 setup(
     name             = "flashdiffusion",
     version          = "0.1.0",
     description      = "Tiled memory-efficient diffusion maps eigensolver",
+    author           = "Julio Candanedo",
+    author_email     = "julio@sparsetrace.ai",
+    license          = "MIT",
     package_dir      = {"": "src"},
     packages         = ["flashdiffusion"],
     python_requires  = ">=3.10",
     install_requires = ["numpy>=1.24", "scipy>=1.10"],
     extras_require   = {
-        "cuda": ["torch>=2.1", "ninja"],
-        "dev":  ["pytest>=7.0", "matplotlib"],
+        "cuda":     ["torch>=2.1", "ninja"],
+        "examples": ["matplotlib>=3.7", "scikit-learn>=1.3", "jupyter>=1.0"],
+        "dev":      ["pytest>=7.0", "ruff>=0.3.0", "black>=24.0"],
     },
     ext_modules = ext_modules,
     cmdclass    = cmdclass,
