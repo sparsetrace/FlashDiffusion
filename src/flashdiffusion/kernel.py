@@ -57,24 +57,63 @@ def _cuda_sm() -> int | None:
 # SM -> which kernel family to use
 # SM120 (RTX 50xx) uses mma.sync (same family as SM80), not wgmma
 _SM_BACKEND = {
-    80: "sm80", 86: "sm80", 89: "sm80",  # Ampere / Ada
-    90: "sm80",   # Hopper — fall back to sm80 until wgmma kernel written
-    120: "sm80", 121: "sm80",            # consumer Blackwell — mma.sync
-    100: "sm80", 103: "sm80",            # datacenter Blackwell — fall back
+    80: "sm80", 86: "sm80", 89: "sm80",
+    90: "sm90",
+    100: "sm100",  # ← changed
+    103: "sm100",  # ← changed
+    120: "sm120", 121: "sm120",
 }
 
 def _get_cuda_backend():
-    """Return (module, CUDAState constructor) or None if unavailable."""
+    """Return (precompute_fn, matvec_fn) or None if unavailable."""
     sm = _cuda_sm()
     if sm is None:
         return None
     backend_name = _SM_BACKEND.get(sm, "sm80")
+
     if backend_name == "sm80":
         try:
-            from .kernel_cuda import precompute_cuda, matvec_cuda, CUDAState
+            from .kernel_cuda import precompute_cuda, matvec_cuda
             return precompute_cuda, matvec_cuda
         except (ImportError, OSError):
             return None
+
+    elif backend_name == "sm90":
+        try:
+            from .kernel_cuda_sm90 import precompute_sm90, matvec_sm90
+            return precompute_sm90, matvec_sm90
+        except (ImportError, OSError):
+            try:
+                from .kernel_cuda import precompute_cuda, matvec_cuda
+                print("[FlashDiffusion] SM90 not found, falling back to SM80 scalar")
+                return precompute_cuda, matvec_cuda
+            except (ImportError, OSError):
+                return None
+
+    elif backend_name == "sm100":
+        try:
+            from .kernel_cuda_sm100 import precompute_sm100, matvec_sm100
+            return precompute_sm100, matvec_sm100
+        except (ImportError, OSError):
+            try:
+                from .kernel_cuda import precompute_cuda, matvec_cuda
+                print("[FlashDiffusion] SM100 not found, falling back to SM80 scalar")
+                return precompute_cuda, matvec_cuda
+            except (ImportError, OSError):
+                return None
+
+    elif backend_name == "sm120":
+        try:
+            from .kernel_cuda_sm120 import precompute_sm120, matvec_sm120
+            return precompute_sm120, matvec_sm120
+        except (ImportError, OSError):
+            try:
+                from .kernel_cuda import precompute_cuda, matvec_cuda
+                print("[FlashDiffusion] SM120 not found, falling back to SM80 scalar")
+                return precompute_cuda, matvec_cuda
+            except (ImportError, OSError):
+                return None
+
     return None
 
 
