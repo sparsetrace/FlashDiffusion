@@ -84,30 +84,29 @@ _SM_SOURCES = {
     "80":  "src/flashdiffusion/csrc/flash_diffusion_sm80.cu",
     "86":  "src/flashdiffusion/csrc/flash_diffusion_sm80.cu",
     "89":  "src/flashdiffusion/csrc/flash_diffusion_sm80.cu",
-    "90":  "src/flashdiffusion/csrc/flash_diffusion_sm90.cu",   # H100 native
-    "100": "src/flashdiffusion/csrc/flash_diffusion_sm80.cu",   # B200 fallback
-    "103": "src/flashdiffusion/csrc/flash_diffusion_sm80.cu",   # B300 fallback
-    "120": "src/flashdiffusion/csrc/flash_diffusion_sm120.cu",  # RTX 5090
-    "121": "src/flashdiffusion/csrc/flash_diffusion_sm120.cu",  # DGX Spark
+    "90":  "src/flashdiffusion/csrc/flash_diffusion_sm90.cu",
+    "100": "src/flashdiffusion/csrc/flash_diffusion_sm100.cu",
+    "103": "src/flashdiffusion/csrc/flash_diffusion_sm100.cu",
+    "120": "src/flashdiffusion/csrc/flash_diffusion_sm120.cu",
+    "121": "src/flashdiffusion/csrc/flash_diffusion_sm120.cu",
 }
 
 _SM_MODULE = {
     "80":  "flash_diffusion_cuda",
     "86":  "flash_diffusion_cuda",
     "89":  "flash_diffusion_cuda",
-    "90":  "flash_diffusion_sm90",    # pybind11 module name in .cu
-    "100": "flash_diffusion_cuda",
-    "103": "flash_diffusion_cuda",
+    "90":  "flash_diffusion_sm90",
+    "100": "flash_diffusion_sm100",
+    "103": "flash_diffusion_sm100",
     "120": "flash_diffusion_sm120",
     "121": "flash_diffusion_sm120",
 }
 
-# SM90 requires sm_90a (architecture-accelerated) for wgmma.
-# All other SMs use plain sm_NN.
 _SM_ARCH = {
     "80": "sm_80", "86": "sm_86", "89": "sm_89",
-    "90": "sm_90a",   # ← 'a' is critical — wgmma won't work without it
-    "100": "sm_100", "103": "sm_103",
+    "90": "sm_90a",
+    "100": "sm_100a",  # ← changed (needs 'a' for full SM100 features)
+    "103": "sm_100a",  # ← changed (SM103 uses same flag as SM100)
     "120": "sm_120", "121": "sm_121",
 }
 
