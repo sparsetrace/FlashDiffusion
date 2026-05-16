@@ -41,7 +41,45 @@ from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# Distance tile  (shared by prepass and matvec)
+# Backend detection + dispatch
+# ---------------------------------------------------------------------------
+
+def _cuda_sm() -> int | None:
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    except ImportError:
+        return None
+
+# SM -> which kernel family to use
+# SM120 (RTX 50xx) uses mma.sync (same family as SM80), not wgmma
+_SM_BACKEND = {
+    80: "sm80", 86: "sm80", 89: "sm80",  # Ampere / Ada
+    90: "sm80",   # Hopper — fall back to sm80 until wgmma kernel written
+    120: "sm80", 121: "sm80",            # consumer Blackwell — mma.sync
+    100: "sm80", 103: "sm80",            # datacenter Blackwell — fall back
+}
+
+def _get_cuda_backend():
+    """Return (module, CUDAState constructor) or None if unavailable."""
+    sm = _cuda_sm()
+    if sm is None:
+        return None
+    backend_name = _SM_BACKEND.get(sm, "sm80")
+    if backend_name == "sm80":
+        try:
+            from .kernel_cuda import precompute_cuda, matvec_cuda, CUDAState
+            return precompute_cuda, matvec_cuda
+        except (ImportError, OSError):
+            return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Distance tile  (shared by numpy prepass and matvec)
 # ---------------------------------------------------------------------------
 
 def _dist2_tile(
@@ -109,57 +147,55 @@ def prepass_rowsum(
 # ---------------------------------------------------------------------------
 
 def FlashDiffusion(
-    Q:         np.ndarray,                   # (N_q, d)
-    K:         np.ndarray,                   # (N_k, d)
-    V:         np.ndarray,                   # (N_k, r)  r columns
-    beta:      float,
-    rscale_q:  Optional[np.ndarray] = None,  # (N_q,)  default = 1
-    rscale_k:  Optional[np.ndarray] = None,  # (N_k,)  default = 1
-    h:         Optional[np.ndarray] = None,  # (N_k,)  Doob potential, default = 1
-    tile:      int = 512,
+    Q:           np.ndarray,                   # (N_q, d)
+    K:           np.ndarray,                   # (N_k, d)
+    V:           np.ndarray,                   # (N_k, r)  r columns
+    beta:        float,
+    rscale_q:    Optional[np.ndarray] = None,  # (N_q,)  default = 1
+    rscale_k:    Optional[np.ndarray] = None,  # (N_k,)  default = 1
+    h:           Optional[np.ndarray] = None,  # (N_k,)  Doob potential
+    tile:        int  = 512,
+    coord_dtype       = np.float32,            # X tile dtype (f32/f16)
+    accum_dtype       = np.float64,            # accumulator dtype
 ) -> np.ndarray:
     """
-    FlashDiffusion(Q, K, V, beta, rscale_q, rscale_k, h, tile)
+    FlashDiffusion numpy backend (CPU reference / fallback).
 
     out_i = rscale_q_i · Σⱼ exp(-beta·||qᵢ-kⱼ||²) · rscale_k_j · h_j · v_j
 
-    Parameters
-    ----------
-    Q, K   : coordinate matrices (may be identical for DMAP)
-    V      : (N_k, r) right-hand side vectors
-    beta   : kernel bandwidth
-    rscale_q, rscale_k : Coifman-Lafon normalisation diagonals
-                         set both to precomputed rscale for DMAP
-    h      : Doob h-transform potential (optional)
-    tile   : tile size controlling peak SMEM / GMEM traffic
+    Precision contract (numpy path)
+    --------------------------------
+    coord_dtype : X tile storage — fp32 default, fp16 for memory savings
+    accum_dtype : accumulator — fp64 for CPU reference correctness
+    GEMM (dot)  : always fp32 regardless of coord_dtype (catastrophic
+                  cancellation safety for dist² = sqi + sqj - 2*dot)
 
-    Returns
-    -------
-    out : (N_q, r) float64
-
-    Notes
-    -----
-    - No online softmax: rscale is precomputed, epilogue is a scalar multiply.
-    - Tile loop is embarrassingly parallel — maps directly to CuTe thread blocks.
-    - For the CUDA kernel: dist2 tile is a GEMM + diagonal bias; exp is the
-      epilogue; accumulation is plain float32 register tile (no max tracking).
+    CUDA path (see kernel_cuda.py + csrc/flash_diffusion_sm80.cu)
+    ---------------------------------------------------------------
+    coord_dtype -> fp16 smem  (hardcoded in CUDA kernel)
+    GEMM        -> mma.sync fp16->fp32 (SM80) / wgmma fp16->fp32 (SM90)
+    accum_dtype -> fp32 register tile
+    No online softmax: rscale precomputed, epilogue = scalar multiply.
+    No gradients: we compute the harmonic basis (eigenvectors), not a
+    differentiable layer. Use flexattention for the trained forward pass.
     """
     N_q, d = Q.shape
     N_k, r = V.shape
 
+    # GEMM always in fp32 for dist² numerical safety
     Q32 = Q.astype(np.float32)
     K32 = K.astype(np.float32)
     sqQ = (Q32 * Q32).sum(axis=1)
     sqK = (K32 * K32).sum(axis=1)
 
-    # pre-scale the RHS:  u_j = rscale_k_j · h_j · v_j
-    u = V.astype(np.float64)
+    # pre-scale RHS: u_j = rscale_k_j · h_j · v_j
+    u = V.astype(accum_dtype)
     if rscale_k is not None:
         u = rscale_k[:, None] * u
     if h is not None:
         u = h[:, None] * u
 
-    out = np.zeros((N_q, r), dtype=np.float64)
+    out = np.zeros((N_q, r), dtype=accum_dtype)
 
     for i0 in range(0, N_q, tile):
         i1  = min(i0 + tile, N_q)
@@ -171,11 +207,10 @@ def FlashDiffusion(
             Kj  = K32[j0:j1]
             sqk = sqK[j0:j1]
 
-            d2     = _dist2_tile(Qi, Kj, sqi, sqk)
-            K_tile = np.exp(-beta * d2)               # (ti, tj) — epilogue
-            out[i0:i1] += K_tile @ u[j0:j1]           # accumulate
+            d2     = _dist2_tile(Qi, Kj, sqi, sqk)       # fp64
+            K_tile = np.exp(-beta * d2)                   # fp64 epilogue
+            out[i0:i1] += K_tile @ u[j0:j1]
 
-    # post-scale by rscale_q
     if rscale_q is not None:
         out *= rscale_q[:, None]
 
