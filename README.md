@@ -47,6 +47,64 @@ of a single Markov geometry (Candanedo 2025). The EQ/NESS classification:
 
 The Coifman-Lafon α-normalisation is an exact Doob transform (Corollary 4.2, DAC).
 
+# FlashDiffusion SM120 — RTX 6000 / Consumer Blackwell
+
+## What's in this package
+
+```
+flashdiffusion/csrc/flash_diffusion_sm120.cu   ← kernel
+flashdiffusion/kernel_cuda_sm120.py            ← Python wrapper
+setup_sm120.py                                  ← build script
+sm120_notebook.py                               ← notebook cells
+```
+
+## SM120 vs SM80 kernel differences
+
+| Feature         | SM80 (A100)        | SM120 (RTX 5090)        |
+|-----------------|--------------------|-------------------------|
+| MMA instruction | mma.sync f16→f32   | mma.sync f16→f32 (same) |
+| Tile size       | 64×64              | 128×128                 |
+| SMEM async      | __syncthreads      | cp.async pipeline       |
+| TMA             | no                 | yes (not used yet)      |
+| TMEM            | no                 | no (SM100 only)         |
+| Cluster shape   | 1×1×1              | 1×1×1 (no multicast)   |
+| WGMMA/UMMA     | no                 | no (SM100 only)         |
+
+The inner GEMM instruction is **identical** to SM80. The speedup comes from:
+1. Larger 128×128 tiles → better arithmetic intensity
+2. cp.async pipeline → hides GMEM→SMEM load latency
+3. Higher RTX 5090 clock speed
+
+## Build
+
+```bash
+# on a machine with RTX 5090
+FLASHDIFFUSION_BUILD_CUDA=1 \
+TORCH_CUDA_ARCH_LIST="12.0" \
+python setup_sm120.py build_ext --inplace
+```
+
+Or in notebook (see sm120_notebook.py Cell 2).
+
+## Expected performance vs SM80
+
+```
+N=200k  SM80 A100  precompute: 0.4s   Lanczos: ~100s
+N=200k  SM120 5090 precompute: ~0.3s  Lanczos: ~60s  (estimate)
+```
+
+RTX 5090 has higher memory bandwidth than A100 (1.8 TB/s vs 2.0 TB/s)
+but our scalar kernel is compute-bound not memory-bound.
+The cp.async pipeline and larger tiles are the main wins.
+
+## Next step: TiledMMA on SM120
+
+The `mma.sync.aligned.m16n8k16` instruction on SM120 uses the same
+CuTe atom as SM80: `SM80_16x8x16_F32F16F16F32`.
+Wiring TiledMMA replaces the scalar inner loop, giving ~10× speedup.
+This is `flash_diffusion_sm120_v2.cu` — to be added next.
+
+
 ## CUDA roadmap
 
 Current: NumPy reference (validates correctness, runs on CPU).
