@@ -93,8 +93,9 @@ class DiffusionMap:
         from .kernel import _get_cuda_backend
         cuda = _get_cuda_backend()
         if cuda is not None:
-            from .kernel_cuda import precompute_cuda
-            self._cuda_state = precompute_cuda(X, beta, alpha)
+            precompute_fn, matvec_fn = cuda
+            self._cuda_state = precompute_fn(X, beta, alpha)
+            self._matvec_fn  = matvec_fn
             # Mirror numpy fields from GPU tensors for CDC / Doob / Nyström
             self.D_       = self._cuda_state.D.cpu().numpy().astype(np.float64)
             self.D_alpha_ = self._cuda_state.D_alpha.cpu().numpy().astype(np.float64)
