@@ -51,10 +51,7 @@ def find_cuda_includes():
     ]:
         candidates += glob.glob(f"{base}/*/include")
     candidates += ["/usr/local/cuda/include", "/usr/cuda/include"]
-    return [p for p in candidates
-            if os.path.isdir(p) and
-            any(os.path.exists(os.path.join(p, h))
-                for h in ["cuda_runtime.h", "cusparse.h", "cublas.h"])]
+    return [p for p in candidates if os.path.isdir(p)]
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +179,7 @@ _SM_NVCC_DEFINES = {
 
 def _gencode(sm):
     arch    = _SM_ARCH.get(sm, f"sm_{sm}")
-    compute = arch.replace("sm_", "compute_")
+    compute = arch.replace("sm_", "compute_").rstrip("a")  # compute_100a → compute_100
     return f"-gencode=arch={compute},code={arch}"
 
 
