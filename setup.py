@@ -75,9 +75,12 @@ def find_cutlass_include(min_version=None):
     if os.path.isdir(sub):
         candidates.append(sub)
 
-    # notebook builds clone to /tmp/cutlass or /tmp/cutlass37 etc.
+    # in setup.py find_cutlass_include() — add cutlass_main
     for p in sorted(glob.glob("/tmp/cutlass*/include"), reverse=True):
         candidates.append(p)
+    # reverse=True means cutlass_main sorts after cutlass37 alphabetically
+    # better: put cutlass_main first explicitly
+    candidates = ["/tmp/cutlass_main/include"] + candidates
 
     for path in candidates:
         if not os.path.isdir(path):
