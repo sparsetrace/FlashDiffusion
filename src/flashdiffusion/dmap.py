@@ -145,49 +145,108 @@ class DiffusionMap:
         t:        int   = 1,
         tol:      float = 0.0,
         maxiter:  Optional[int] = None,
-    ) -> np.ndarray:
+        use_gpu_lanczos: bool = True,   # ← new flag, default on
+        ) -> np.ndarray:
         """
         Compute diffusion map coordinates.
-
+    
         If X_new is None: eigensolver on training set (fit must be called first).
         If X_new is given: Nyström out-of-sample extension (see utils.nystrom).
-
+    
         Parameters
         ----------
-        X_new   : (M, d) new points, or None for training set
-        t       : diffusion time (eigenvalues raised to power t)
-        tol     : ARPACK tolerance (0 = machine precision)
-        maxiter : ARPACK max iterations
-
+        X_new           : (M, d) new points, or None for training set
+        t               : diffusion time (eigenvalues raised to power t)
+        tol             : ARPACK tolerance (0 = machine precision), fallback only
+        maxiter         : ARPACK max iterations, fallback only
+        use_gpu_lanczos : use GPU Lanczos if CUDA state available (default True)
+    
         Returns
         -------
         coords : (N, n_components-1) — drops the trivial first eigenvector
         """
         self._check_fitted()
-
+    
         if X_new is not None:
             from .utils import nystrom_extend
             return nystrom_extend(self, X_new, t=t)
-
-        from .eigensolver import lanczos_eigsh
-        vals, vecs = lanczos_eigsh(
-            self.matvec,
-            N       = self.X_.shape[0],
-            k       = self.n_components,
-            tol     = tol,
-            maxiter = maxiter,
-        )
+    
+        # ── eigensolver dispatch ─────────────────────────────────────────────
+        vals, vecs = self._solve_eigenproblem(
+            tol=tol, maxiter=maxiter, use_gpu_lanczos=use_gpu_lanczos)
+    
         self.eigenvalues_  = vals
         self.eigenvectors_ = vecs
-
-        # convert symmetric-M eigenvectors -> row-normalised P+ eigenvectors
+    
+        # convert symmetric-M eigenvectors → row-normalised P+ eigenvectors
         psi = vecs / self.rscale_[:, None]
         psi /= np.linalg.norm(psi, axis=0, keepdims=True)
-
+    
         # diffusion map embedding: scale by λ^t, drop trivial first vector
         coords = psi[:, 1:] * (vals[1:] ** t)[None, :]
         self.embedding_ = coords
         return coords
+    
+    
+    def _solve_eigenproblem(
+        self,
+        tol:             float = 0.0,
+        maxiter:         Optional[int] = None,
+        use_gpu_lanczos: bool = True,
+        ) -> tuple:
+        """
+        Dispatch to GPU Lanczos or scipy ARPACK.
+        Returns (vals, vecs) as numpy arrays.
+        """
+        N = self.X_.shape[0]
+        k = self.n_components
+    
+        # ── GPU Lanczos path ─────────────────────────────────────────────────
+        if use_gpu_lanczos and self._cuda_state is not None:
+            try:
+                import sys
+                import torch
+                from .eigensolver_gpu import gpu_lanczos, make_gpu_matvec
+    
+                # find the ext module that was injected by the notebook build
+                _EXT_NAMES = {
+                    'CUDAState':      'flash_diffusion_cuda',
+                    'CUDAStateSM90':  'flash_diffusion_sm90',
+                    'CUDAStateSM100': 'flash_diffusion_sm100',
+                    'CUDAStateSM120': 'flash_diffusion_sm120',
+                }
+                ext_name = _EXT_NAMES.get(
+                    type(self._cuda_state).__name__, 'flash_diffusion_cuda')
+                ext = sys.modules.get(ext_name)
+    
+                if ext is None:
+                    raise RuntimeError(
+                        f"{ext_name} not in sys.modules — "
+                        "build the kernel first then call dm.fit()")
+    
+                matvec_gpu = make_gpu_matvec(self._cuda_state, ext)
+                vals, vecs = gpu_lanczos(
+                    matvec_gpu,
+                    N   = N,
+                    k   = k,
+                    p   = min(16, max(k, N // 1000)),
+                    tol = 1e-6,
+                )
+                return vals, vecs
+    
+            except Exception as e:
+                print(f"[DiffusionMap] GPU Lanczos failed ({e}), "
+                      f"falling back to ARPACK")
+    
+        # ── scipy ARPACK fallback ────────────────────────────────────────────
+        from .eigensolver import lanczos_eigsh
+        return lanczos_eigsh(
+            self.matvec,
+            N       = N,
+            k       = k,
+            tol     = tol,
+            maxiter = maxiter,
+        )
 
     # ------------------------------------------------------------------
     # Doob h-transform: returns a new DiffusionMap-like matvec
