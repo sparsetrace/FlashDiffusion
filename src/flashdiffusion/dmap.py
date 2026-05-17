@@ -124,8 +124,7 @@ class DiffusionMap:
         self._check_fitted()
 
         if self._cuda_state is not None:
-            from .kernel_cuda import matvec_cuda
-            return matvec_cuda(self._cuda_state, v)
+            return self._matvec_fn(self._cuda_state, v)
 
         # numpy path
         v2d = v.reshape(-1, 1)
