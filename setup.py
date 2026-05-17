@@ -153,8 +153,8 @@ _SM_ARCH = {
 # SM100 needs CUTLASS >= 3.7.0 (UMMA + TmemAllocator)
 _SM_CUTLASS_MIN = {
     "90":  "3.5.1",
-    "100": "3.7.0",
-    "103": "3.7.0",
+    "100": None,
+    "103": None,
 }
 
 # Extra nvcc defines per SM
