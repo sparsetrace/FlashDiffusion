@@ -50,7 +50,7 @@ class DiffusionMap:
     def __init__(
         self,
         beta:          float = 1.0,
-        alpha:         float = 0.5,
+        alpha:         float = 1.0,
         n_components:  int   = 8,
         tile:          int   = 512,
     ):
