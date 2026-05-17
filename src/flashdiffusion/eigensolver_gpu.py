@@ -95,7 +95,7 @@ def gpu_lanczos(
         dtype = torch.float32
 
     if n_iter is None:
-        n_iter = min(3 * k + 20, N)   # enough for well-separated eigenvalues
+        n_iter = min(6 * k + 40, N)   # 88 for k=8 — converges for typical DMAP spectra
 
     t_start = time.perf_counter()
     if verbose:
@@ -110,7 +110,8 @@ def gpu_lanczos(
 
     # random normalised start vector
     torch.manual_seed(42)
-    q = torch.randn(N, dtype=dtype, device=device)
+    # constant start — guaranteed overlap with trivial eigenvector (λ=1)
+    q  = torch.ones(N, dtype=dtype, device=device)
     q /= q.norm()
     Q[:, 0] = q
 
