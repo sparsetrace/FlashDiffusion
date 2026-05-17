@@ -47,7 +47,7 @@
 #include <cute/atom/mma_atom.hpp>
 #include <cute/arch/mma_sm100_umma.hpp>    // SM100_MMA_F16BF16_SS
 #include <cute/arch/copy_sm100.hpp>         // TMA for SM100
-#include <cute/arch/tmem_allocator.hpp>     // TMEM allocation
+#include <cute/arch/tmem_allocator_sm100.hpp>   // TMEM allocation
 
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
