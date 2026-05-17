@@ -229,7 +229,6 @@ class DiffusionMap:
                     matvec_gpu,
                     N   = N,
                     k   = k,
-                    p   = min(16, max(k, N // 1000)),
                     tol = 1e-6,
                 )
                 return vals, vecs
