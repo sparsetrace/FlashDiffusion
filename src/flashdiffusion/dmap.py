@@ -100,7 +100,7 @@ class DiffusionMap:
             self.D_       = self._cuda_state.D.cpu().numpy().astype(np.float64)
             self.D_alpha_ = self._cuda_state.D_alpha.cpu().numpy().astype(np.float64)
             self.rscale_  = self._cuda_state.rscale.cpu().numpy().astype(np.float64)
-            print(f"  precompute done (CUDA) in {time.perf_counter()-t0:.3f}s")
+            print(f"  precompute done ({self._cuda_state.__class__.__name__}) in {time.perf_counter()-t0:.3f}s")
             return self
 
         # Numpy fallback
