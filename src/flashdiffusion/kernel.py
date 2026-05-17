@@ -57,10 +57,10 @@ def _cuda_sm() -> int | None:
 # SM -> which kernel family to use
 # SM120 (RTX 50xx) uses mma.sync (same family as SM80), not wgmma
 _SM_BACKEND = {
-    80: "sm80", 86: "sm80", 89: "sm80",
-    90: "sm90",
-    100: "sm100",  # ← changed
-    103: "sm100",  # ← changed
+    80:  "sm80", 86: "sm80", 89: "sm80",
+    90:  "sm90",
+    100: "sm100",
+    103: "sm100",
     120: "sm120", 121: "sm120",
 }
 
@@ -85,7 +85,7 @@ def _get_cuda_backend():
         except (ImportError, OSError):
             try:
                 from .kernel_cuda import precompute_cuda, matvec_cuda
-                print("[FlashDiffusion] SM90 not found, falling back to SM80 scalar")
+                print("[FlashDiffusion] SM90 not found, falling back to SM80")
                 return precompute_cuda, matvec_cuda
             except (ImportError, OSError):
                 return None
@@ -97,7 +97,7 @@ def _get_cuda_backend():
         except (ImportError, OSError):
             try:
                 from .kernel_cuda import precompute_cuda, matvec_cuda
-                print("[FlashDiffusion] SM100 not found, falling back to SM80 scalar")
+                print("[FlashDiffusion] SM100 not found, falling back to SM80")
                 return precompute_cuda, matvec_cuda
             except (ImportError, OSError):
                 return None
@@ -109,7 +109,7 @@ def _get_cuda_backend():
         except (ImportError, OSError):
             try:
                 from .kernel_cuda import precompute_cuda, matvec_cuda
-                print("[FlashDiffusion] SM120 not found, falling back to SM80 scalar")
+                print("[FlashDiffusion] SM120 not found, falling back to SM80")
                 return precompute_cuda, matvec_cuda
             except (ImportError, OSError):
                 return None
