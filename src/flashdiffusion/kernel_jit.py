@@ -19,14 +19,14 @@ def _build_kernel(sm, repo_root, verbose=False):
     
     # SM → source + arch
     _SOURCES = {
-        80:  ('flash_diffusion_sm80.cu',   'sm_80',   False, 'flash_diffusion_sm80'),
-        86:  ('flash_diffusion_sm80.cu',   'sm_80',   False, 'flash_diffusion_cuda'),
-        89:  ('flash_diffusion_sm80.cu',   'sm_80',   False, 'flash_diffusion_cuda'),
-        90:  ('flash_diffusion_sm90.cu',   'sm_90a',  True,  'flash_diffusion_sm90'),
-        100: ('flash_diffusion_sm100.cu',  'sm_100a', True,  'flash_diffusion_sm100'),
-        103: ('flash_diffusion_sm100.cu',  'sm_100a', True,  'flash_diffusion_sm100'),
-        120: ('flash_diffusion_sm120.cu',  'sm_120',  False, 'flash_diffusion_sm120'),  # ← WMMA, same file
-        121: ('flash_diffusion_sm80.cu',   'sm_120',  False, 'flash_diffusion_cuda'),
+        80:  ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),
+        86:  ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),
+        89:  ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),
+        90:  ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),  # fallback
+        100: ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),  # fallback
+        103: ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),  # fallback
+        120: ('flash_diffusion_sm120.cu', 'sm_120', False, 'flash_diffusion_sm120'),
+        121: ('flash_diffusion_sm120.cu', 'sm_120', False, 'flash_diffusion_sm120'),
     }
     cu_file, arch, needs_cutlass, mod_name = _SOURCES.get(sm, _SOURCES[80])
     
