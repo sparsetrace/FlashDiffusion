@@ -21,16 +21,18 @@ _ext = None   # injected by notebook or loaded via _load_ext()
 def _load_ext():
     global _ext
     if _ext is None:
-        try:
-            import flash_diffusion_sm120 as ext
-            _ext = ext
-        except ImportError as e:
-            raise ImportError(
-                "flash_diffusion_sm120 not compiled. Build with:\n"
-                "  FLASHDIFFUSION_BUILD_CUDA=1 "
-                "  TORCH_CUDA_ARCH_LIST='12.0' "
-                "  pip install -e '.[cuda]'"
-            ) from e
+        import sys
+        # check sys.modules first — kernel_jit.py injects here at import time
+        ext = sys.modules.get('flash_diffusion_sm120')
+        if ext is None:
+            try:
+                import flash_diffusion_sm120 as ext
+            except ImportError as e:
+                raise ImportError(
+                    "flash_diffusion_sm120 not compiled. "
+                    "Try: import flashdiffusion (triggers JIT build)"
+                ) from e
+        _ext = ext
     return _ext
 
 
