@@ -11,6 +11,12 @@ _CACHE_DIR = os.path.expanduser('~/.cache/flashdiffusion')
 def _build_kernel(sm, repo_root, verbose=False):
     """JIT-build the right kernel for this GPU. Returns loaded module."""
 
+    import importlib
+    if importlib.util.find_spec('ninja') is None:
+        import subprocess, sys
+        subprocess.check_call(
+            [sys.executable, '-m', 'pip', 'install', '-q', 'ninja'])
+    
     # SM → source + arch
     _SOURCES = {
         80: ('flash_diffusion_sm80.cu',   'sm_80',   False),
