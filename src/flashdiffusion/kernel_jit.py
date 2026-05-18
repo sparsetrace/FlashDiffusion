@@ -11,27 +11,26 @@ _CACHE_DIR = os.path.expanduser('~/.cache/flashdiffusion')
 def _build_kernel(sm, repo_root, verbose=False):
     """JIT-build the right kernel for this GPU. Returns loaded module."""
 
+    # fix 1: no local import of sys — use module-level sys
     import importlib
     if importlib.util.find_spec('ninja') is None:
-        import subprocess, sys
         subprocess.check_call(
             [sys.executable, '-m', 'pip', 'install', '-q', 'ninja'])
-    
-    # SM → source + arch
+
     _SOURCES = {
         80:  ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),
         86:  ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),
         89:  ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),
-        90:  ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),  # fallback
-        100: ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),  # fallback
-        103: ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),  # fallback
+        90:  ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),
+        100: ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),
+        103: ('flash_diffusion_sm80.cu',  'sm_80',  False, 'flash_diffusion_cuda'),
         120: ('flash_diffusion_sm120.cu', 'sm_120', False, 'flash_diffusion_sm120'),
         121: ('flash_diffusion_sm120.cu', 'sm_120', False, 'flash_diffusion_sm120'),
     }
-    cu_file, arch, needs_cutlass, mod_name = _SOURCES.get(sm, _SOURCES[80])
-    
-    cu_path  = os.path.join(repo_root, 'src', 'flashdiffusion', 'csrc', cu_file)
-    mod_name = os.path.splitext(cu_file)[0]   # e.g. flash_diffusion_sm100
+    cu_file, arch, needs_cutlass, mod_name = _SOURCES.get(sm, _SOURCES[80])  # fix 2: keep mod_name from tuple
+
+    cu_path   = os.path.join(repo_root, 'src', 'flashdiffusion', 'csrc', cu_file)
+    # removed: mod_name = os.path.splitext(cu_file)[0]  ← this was overwriting the correct name
 
     build_dir = os.path.join(_CACHE_DIR, f'sm{sm}')
     os.makedirs(build_dir, exist_ok=True)
