@@ -1,59 +1,30 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "flashdiffusion"
 version = "0.1.0"
-description = "FlashDiffusion: tiled memory-efficient diffusion maps eigensolver"
+description = "GPU-accelerated diffusion maps with tensor core kernels"
 readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [
-  { name = "Julio Candanedo", email = "julio@sparsetrace.ai" }
+authors = [{name = "Julio Candanedo", email = "julio@sparsetrace.ai"}]
+keywords = ["diffusion maps", "manifold learning", "CUDA", "tensor cores", "GPU"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
 ]
+dependencies = ["numpy>=1.24", "scipy>=1.10", "ninja"]
 
-# core deps — CPU-only install stays light
-dependencies = [
-  "numpy>=1.24",
-  "scipy>=1.10",
-]
-
-[project.optional-dependencies]
-cuda = [
-  "torch>=2.1",
-  "ninja",           # ← here: optional dep for CUDA extension build
-]
-examples = [
-  "matplotlib>=3.7",
-  "scikit-learn>=1.3",
-  "jupyter>=1.0",
-]
-dev = [
-  "pytest>=7.0",
-  "ruff>=0.3.0",
-  "black>=24.0",
-]
-all = [
-  "torch>=2.1",
-  "ninja",
-  "matplotlib>=3.7",
-  "scikit-learn>=1.3",
-  "pytest>=7.0",
-  "ruff>=0.3.0",
-  "black>=24.0",
-]
-
-[tool.setuptools]
-package-dir = {"" = "src"}
+[project.urls]
+Homepage = "https://github.com/sparsetrace/FlashDiffusion"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.ruff]
-line-length = 100
-target-version = "py310"
-
-[tool.black]
-line-length = 100
-target-version = ["py310"]
