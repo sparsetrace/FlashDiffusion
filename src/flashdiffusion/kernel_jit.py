@@ -93,7 +93,9 @@ def _load_so(so_path, mod_name):
     spec = importlib.util.spec_from_file_location(mod_name, so_path)
     mod  = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    sys.modules[mod_name] = mod
+    # after loading the .so:
+    sys.modules[mod_name] = mod           # 'flash_diffusion_sm80'
+    sys.modules['flash_diffusion_cuda'] = mod  # ← also inject as the legacy name
     return mod
 
 
