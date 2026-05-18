@@ -25,7 +25,7 @@ def _build_kernel(sm, repo_root, verbose=False):
         90:  ('flash_diffusion_sm90.cu',   'sm_90a',  True,  'flash_diffusion_sm90'),
         100: ('flash_diffusion_sm100.cu',  'sm_100a', True,  'flash_diffusion_sm100'),
         103: ('flash_diffusion_sm100.cu',  'sm_100a', True,  'flash_diffusion_sm100'),
-        120: ('flash_diffusion_sm80.cu',   'sm_120',  False, 'flash_diffusion_cuda'),  # ← WMMA, same file
+        120: ('flash_diffusion_sm120.cu',  'sm_120',  False, 'flash_diffusion_sm120'),  # ← WMMA, same file
         121: ('flash_diffusion_sm80.cu',   'sm_120',  False, 'flash_diffusion_cuda'),
     }
     cu_file, arch, needs_cutlass, mod_name = _SOURCES.get(sm, _SOURCES[80])
