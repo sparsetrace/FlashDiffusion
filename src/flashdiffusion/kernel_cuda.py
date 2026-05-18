@@ -33,15 +33,17 @@ _ext = None
 def _load_ext():
     global _ext
     if _ext is None:
-        try:
-            import flash_diffusion_cuda as ext
-            _ext = ext
-        except ImportError as e:
-            raise ImportError(
-                "flash_diffusion_cuda extension not compiled. "
-                "Run: pip install -e '.[cuda]' or "
-                "cd csrc && nvcc -arch=sm_80 ... "
-            ) from e
+        import sys
+        ext = sys.modules.get('flash_diffusion_cuda')
+        if ext is None:
+            try:
+                import flash_diffusion_cuda as ext
+            except ImportError as e:
+                raise ImportError(
+                    "flash_diffusion_cuda not compiled. "
+                    "Try: import flashdiffusion (triggers JIT build)"
+                ) from e
+        _ext = ext
     return _ext
 
 
