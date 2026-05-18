@@ -28,3 +28,6 @@ Homepage = "https://github.com/sparsetrace/FlashDiffusion"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+flashdiffusion = ["csrc/*.cu", "csrc/*.cuh"]
