@@ -97,7 +97,7 @@ def gpu_lanczos(
 
     if n_iter is None:
         #n_iter = min(6 * k + 40, N)   # 88 for k=8 — converges for typical DMAP spectra
-        n_iter = min(4 * k + 4, N)   # 36 for k=8 with warm start
+        n_iter = min(6 * k, N)   # 48 for k=8 with warm start
 
 
     t_start = time.perf_counter()
