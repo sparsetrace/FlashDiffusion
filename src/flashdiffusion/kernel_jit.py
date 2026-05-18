@@ -93,9 +93,18 @@ def _load_so(so_path, mod_name):
     spec = importlib.util.spec_from_file_location(mod_name, so_path)
     mod  = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    # after loading the .so:
-    sys.modules[mod_name] = mod           # 'flash_diffusion_sm80'
-    sys.modules['flash_diffusion_cuda'] = mod  # ← also inject as the legacy name
+    sys.modules[mod_name] = mod
+
+    # legacy names that kernel_cuda_*.py files expect to import
+    _LEGACY = {
+        'flash_diffusion_sm80':  'flash_diffusion_cuda',   # kernel_cuda.py
+        'flash_diffusion_sm90':  'flash_diffusion_sm90',   # kernel_cuda_sm90.py
+        'flash_diffusion_sm100': 'flash_diffusion_sm100',  # kernel_cuda_sm100.py
+        'flash_diffusion_sm120': 'flash_diffusion_sm120',  # kernel_cuda_sm120.py
+    }
+    for name in set([mod_name, _LEGACY.get(mod_name, mod_name)]):
+        sys.modules[name] = mod
+
     return mod
 
 
