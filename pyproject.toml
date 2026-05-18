@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flashdiffusion"
-version = "0.1.0"
+version = "0.1.1"
 description = "GPU-accelerated diffusion maps with tensor core kernels"
 readme = "README.md"
 license = {text = "MIT"}
