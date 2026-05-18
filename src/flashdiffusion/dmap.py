@@ -225,12 +225,14 @@ class DiffusionMap:
                         "build the kernel first then call dm.fit()")
     
                 matvec_gpu = make_gpu_matvec(self._cuda_state, ext)
-                vals, vecs = gpu_lanczos(
-                    matvec_gpu,
-                    N   = N,
-                    k   = k,
-                    tol = 1e-6,
-                )
+                
+                # in the GPU Lanczos branch:
+                q0 = torch.from_numpy(
+                    np.sqrt(self._cuda_state.D_alpha.cpu().numpy())
+                ).to(device='cuda', dtype=torch.float32)
+                q0 /= q0.norm()
+                
+                vals, vecs = gpu_lanczos(matvec_gpu, N=N, k=k, tol=1e-6, q0=q0)
                 return vals, vecs
     
             except Exception as e:
