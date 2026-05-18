@@ -96,7 +96,9 @@ def gpu_lanczos(
         dtype = torch.float32
 
     if n_iter is None:
-        n_iter = min(6 * k + 40, N)   # 88 for k=8 — converges for typical DMAP spectra
+        #n_iter = min(6 * k + 40, N)   # 88 for k=8 — converges for typical DMAP spectra
+        n_iter = min(3 * k + 4, N)   # 28 for k=8 with warm start
+
 
     t_start = time.perf_counter()
     if verbose:
