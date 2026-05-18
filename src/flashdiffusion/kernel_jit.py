@@ -19,16 +19,17 @@ def _build_kernel(sm, repo_root, verbose=False):
     
     # SM → source + arch
     _SOURCES = {
-        80: ('flash_diffusion_sm80.cu',   'sm_80',   True),
-        86: ('flash_diffusion_sm80.cu',   'sm_80',   False),
-        89: ('flash_diffusion_sm80.cu',   'sm_80',   False),
-        90: ('flash_diffusion_sm90.cu',   'sm_90a',  True),
-        100:('flash_diffusion_sm100.cu',  'sm_100a', True),
-        103:('flash_diffusion_sm100.cu',  'sm_100a', True),
-        120:('flash_diffusion_sm120.cu',  'sm_120',  False),
-        121:('flash_diffusion_sm120.cu',  'sm_120',  False),
+        80:  ('flash_diffusion_sm80.cu',   'sm_80',   False, 'flash_diffusion_cuda'),
+        86:  ('flash_diffusion_sm80.cu',   'sm_80',   False, 'flash_diffusion_cuda'),
+        89:  ('flash_diffusion_sm80.cu',   'sm_80',   False, 'flash_diffusion_cuda'),
+        90:  ('flash_diffusion_sm90.cu',   'sm_90a',  True,  'flash_diffusion_sm90'),
+        100: ('flash_diffusion_sm100.cu',  'sm_100a', True,  'flash_diffusion_sm100'),
+        103: ('flash_diffusion_sm100.cu',  'sm_100a', True,  'flash_diffusion_sm100'),
+        120: ('flash_diffusion_sm80.cu',   'sm_120',  False, 'flash_diffusion_cuda'),  # ← WMMA, same file
+        121: ('flash_diffusion_sm80.cu',   'sm_120',  False, 'flash_diffusion_cuda'),
     }
-    cu_file, arch, needs_cutlass = _SOURCES.get(sm, _SOURCES[80])
+    cu_file, arch, needs_cutlass, mod_name = _SOURCES.get(sm, _SOURCES[80])
+    
     cu_path  = os.path.join(repo_root, 'src', 'flashdiffusion', 'csrc', cu_file)
     mod_name = os.path.splitext(cu_file)[0]   # e.g. flash_diffusion_sm100
 
