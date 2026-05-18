@@ -282,7 +282,7 @@ torch::Tensor matvec(
     return out;
 }
 
-PYBIND11_MODULE(flash_diffusion_cuda, m) {
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashDiffusion WMMA tensor cores — SM80/SM86/SM89/SM120/SM121";
     m.def("compute_sq_norms", &compute_sq_norms, py::arg("X_fp16"));
     m.def("prepass",  &prepass,
