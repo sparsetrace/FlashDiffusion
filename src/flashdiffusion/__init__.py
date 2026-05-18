@@ -1,6 +1,11 @@
 # src/flashdiffusion/__init__.py
-import os, torch
 
+import sys, os
+_src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _src not in sys.path:
+    sys.path.insert(0, _src)
+
+import os, torch
 def _jit_init():
     """On first import: detect GPU, JIT-build kernel, inject into sys.modules."""
     if not torch.cuda.is_available():
