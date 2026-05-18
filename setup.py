@@ -308,7 +308,7 @@ setup(
     package_dir      = {"": "src"},
     packages         = ["flashdiffusion"],
     python_requires  = ">=3.10",
-    install_requires = ["numpy>=1.24", "scipy>=1.10"],
+    install_requires = ["numpy>=1.24", "scipy>=1.10", "ninja"],
     extras_require   = {
         "cuda":     ["torch>=2.1", "ninja"],
         "examples": ["matplotlib>=3.7", "scikit-learn>=1.3", "jupyter>=1.0"],
