@@ -19,7 +19,7 @@ def _build_kernel(sm, repo_root, verbose=False):
     
     # SM → source + arch
     _SOURCES = {
-        80: ('flash_diffusion_sm80.cu',   'sm_80',   False),
+        80: ('flash_diffusion_sm80.cu',   'sm_80',   True),
         86: ('flash_diffusion_sm80.cu',   'sm_80',   False),
         89: ('flash_diffusion_sm80.cu',   'sm_80',   False),
         90: ('flash_diffusion_sm90.cu',   'sm_90a',  True),
