@@ -52,6 +52,7 @@ def gpu_lanczos(
     dtype           = None,
     device:   str   = "cuda",
     verbose:  bool  = True,
+    q0=None
 ) -> tuple:
     """
     Plain GPU Lanczos with full re-orthogonalization for top-k eigenvalues.
@@ -110,9 +111,14 @@ def gpu_lanczos(
 
     # random normalised start vector
     torch.manual_seed(42)
-    # constant start — guaranteed overlap with trivial eigenvector (λ=1)
-    q  = torch.ones(N, dtype=dtype, device=device)
+    # correct warm start (exact leading eigenvector of P):
+    # pass D_alpha from state as optional q0
+    if q0 is not None:
+        q = q0.to(dtype=dtype)
+    else:
+        q = torch.ones(N, dtype=dtype, device=device)
     q /= q.norm()
+
     Q[:, 0] = q
 
     j_final = n_iter   # actual steps taken (may terminate early)
