@@ -55,9 +55,8 @@ def knn_bandwidth(X: np.ndarray, k: int = 7) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Nyström out-of-sample extension
 # ---------------------------------------------------------------------------
-
 def nystrom_extend(
-    dm,                              # fitted DiffusionMap
+    dm,
     X_new: np.ndarray,               # (M, d)  new points
     t:     int = 1,
 ) -> np.ndarray:
@@ -83,44 +82,51 @@ def nystrom_extend(
         raise RuntimeError("Call transform() on training data first.")
 
     beta, alpha, tile = dm.beta, dm.alpha, dm.tile
-    X_train  = dm.X_
+
+    # ── center new points with training mean ────────────────────────────
+    # Must use dm.mu_ (training mean) not X_new.mean().
+    # Consistency: kernel sees (x_new - mu) vs (x_train - mu) = dm.X_
+    # dm.X_ is already centered from fit(), so this is the only change.
+    if not hasattr(dm, 'mu_'):
+        raise RuntimeError(
+            "dm.mu_ not found — refit with the updated fit() that stores mu_.")
+    X_new = np.asarray(X_new, dtype=np.float64) - dm.mu_   # (M, D) centered
+
+    # everything below is unchanged — dm.X_ is already centered
+    X_train  = dm.X_                                        # (N, D) centered
     N_train  = X_train.shape[0]
     rscale_k = dm.rscale_
 
     # normalise new points against training set
-    # D_new_i = Σⱼ K(x*_i, x_j)  · w_j   (using training w)
     w_train = dm.D_ ** (-alpha)
     D_new   = prepass_rowsum(X_new, X_train, beta,
                               weights_k=w_train, tile=tile)
     w_new   = D_new ** (-alpha)
 
-    # D_alpha_new_i = (Σⱼ K(x*_i, xⱼ) · w_j) · w_new_i  (approx, Nyström)
-    D_alpha_new = D_new * w_new          # approximate row sum in alpha-kernel
-    inv_Dalpha_new = w_new / D_alpha_new # = 1/D_new  (since D_alpha_new = D_new*w)
+    D_alpha_new    = D_new * w_new
+    inv_Dalpha_new = w_new / D_alpha_new
 
-    # rscale for new query points
     rscale_q_new = D_alpha_new ** (-0.5) * w_new
 
-    # get training eigenvectors in P⁺ basis
-    phi = dm.eigenvectors_ / dm.rscale_[:, None]   # (N_train, k)
+    # training eigenvectors in P⁺ basis
+    phi = dm.eigenvectors_ / dm.rscale_[:, None]            # (N_train, k)
     phi /= np.linalg.norm(phi, axis=0, keepdims=True)
 
-    # Nyström: apply K_alpha from new -> training
-    # coords_new_k = (1/λₖ) · Σⱼ K_alpha(x*_i, xⱼ) · φₖ(xⱼ)
+    # Nyström kernel pass
     coords_new = FlashDiffusion(
-        Q        = X_new,
-        K        = X_train,
-        V        = phi[:, 1:],           # drop trivial first eigvec
+        Q        = X_new,                                   # ← centered
+        K        = X_train,                                 # ← already centered
+        V        = phi[:, 1:],
         beta     = beta,
         rscale_q = rscale_q_new,
         rscale_k = rscale_k,
         tile     = tile,
     )
-    # scale by 1/λₖ and λₖ^t -> net scale λₖ^{t-1}
+
     lam = dm.eigenvalues_[1:]
     coords_new *= (lam ** (t - 1))[None, :]
 
-    return coords_new                    # (M, k-1)
+    return coords_new                                        # (M, k-1)
 
 
 # ---------------------------------------------------------------------------
