@@ -78,23 +78,35 @@ class DiffusionMap:
     def fit(self, X: np.ndarray) -> "DiffusionMap":
         """
         Precompute Coifman-Lafon normalisation for dataset X.
-
+    
         Uses CUDA backend (two GPU prepass kernels) if available,
         otherwise numpy CPU fallback. Either way the interface is identical.
         """
         N = X.shape[0]
-        self.X_ = X.astype(np.float64)
         beta, alpha, tile = self.beta, self.alpha, self.tile
-
+    
         print(f"[DiffusionMap.fit] N={N}  beta={beta}  alpha={alpha}")
         t0 = time.perf_counter()
-
+    
+        # ── center before everything else ───────────────────────────────────
+        # Isometric: ||xi - xj||² = ||x_bar_i - x_bar_j||² exactly.
+        # Leaves all eigenvalues and eigenvectors unchanged in exact arithmetic.
+        # Numerical benefit: keeps ||x_bar_i||² = O(D·sigma²) with no mean-offset,
+        # preventing underflow in exp(-beta·||x_bar_i||²) for large D or large mu.
+        # mu_ stored for Nyström out-of-sample extension: x_new_bar = x_new - mu_
+        X        = np.asarray(X, dtype=np.float64)
+        self.mu_ = X.mean(axis=0)                    # (D,) fp64
+        X_bar    = X - self.mu_                      # (N, D) centered
+    
+        # store centered version (was self.X_ = X before)
+        self.X_  = X_bar
+    
         # Try CUDA first
         from .kernel import _get_cuda_backend
         cuda = _get_cuda_backend()
         if cuda is not None:
             precompute_fn, matvec_fn = cuda
-            self._cuda_state = precompute_fn(X, beta, alpha)
+            self._cuda_state = precompute_fn(X_bar, beta, alpha)  # ← X_bar not X
             self._matvec_fn  = matvec_fn
             # Mirror numpy fields from GPU tensors for CDC / Doob / Nyström
             self.D_       = self._cuda_state.D.cpu().numpy().astype(np.float64)
@@ -102,14 +114,14 @@ class DiffusionMap:
             self.rscale_  = self._cuda_state.rscale.cpu().numpy().astype(np.float64)
             print(f"  precompute done ({self._cuda_state.__class__.__name__}) in {time.perf_counter()-t0:.3f}s")
             return self
-
-        # Numpy fallback
+    
+        # Numpy fallback — also receives X_bar
         self._cuda_state = None
-        D = prepass_rowsum(X, X, beta,
+        D = prepass_rowsum(X_bar, X_bar, beta,
                            weights_k=np.ones(N, np.float64), tile=tile)
         self.D_ = D
         w = D ** (-alpha)
-        D_alpha = prepass_rowsum(X, X, beta, weights_k=w, tile=tile) * w
+        D_alpha = prepass_rowsum(X_bar, X_bar, beta, weights_k=w, tile=tile) * w
         self.D_alpha_ = D_alpha
         d_half = D_alpha ** (-0.5)
         self.rscale_ = d_half * w
