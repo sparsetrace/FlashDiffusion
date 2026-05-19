@@ -53,11 +53,13 @@ class DiffusionMap:
         alpha:         float = 1.0,
         n_components:  int   = 8,
         tile:          int   = 512,
+        n_iter:        int   = None,
     ):
         self.beta         = beta
         self.alpha        = alpha
         self.n_components = n_components
         self.tile         = tile
+        self.n_iter       = n_iter  # None → gpu_lanczos uses its default (6k+20)
 
         # set after fit()
         self.X_:          Optional[np.ndarray] = None
@@ -100,6 +102,13 @@ class DiffusionMap:
     
         # store centered version (was self.X_ = X before)
         self.X_  = X_bar
+
+        # In dmap.py fit(), before passing to CUDA: !!!!!!!!!!!!!!!!!!!!!!!
+        if X_bar.shape[1] < 16:
+            pad = 16 - X_bar.shape[1]
+            X_bar_padded = np.pad(X_bar, ((0,0),(0,pad)))  # zero pad to D=16
+        else:
+            X_bar_padded = X_bar
     
         # Try CUDA first
         from .kernel import _get_cuda_backend
@@ -244,7 +253,7 @@ class DiffusionMap:
                 ).to(device='cuda', dtype=torch.float32)
                 q0 /= q0.norm()
                 
-                vals, vecs = gpu_lanczos(matvec_gpu, N=N, k=k, tol=1e-6, q0=q0)
+                vals, vecs = gpu_lanczos(matvec_gpu, N=N, k=k, tol=1e-6, q0=q0, n_iter=self.n_iter)
                 return vals, vecs
     
             except Exception as e:
