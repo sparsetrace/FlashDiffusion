@@ -756,3 +756,6 @@ def make_gpu_matmat(state, ext_module):
             return torch.stack(cols, dim=1)
 
     return matmat_gpu
+
+from flashdiffusion.block_irlm_fixed import gpu_block_lanczos
+gpu_lanczos = gpu_block_lanczos
