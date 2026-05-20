@@ -30,6 +30,7 @@ def gpu_irlm_dense_qr(
     reorthogonalize: bool = True,
     reorth_passes: int = 2,
     block_rows: int = 262_144,
+    compute_true_residuals: bool = True,
     return_info: bool = False,
     return_torch: bool = False,
 ):
@@ -68,8 +69,8 @@ def gpu_irlm_dense_qr(
         Print per-cycle convergence info.
     q0 : torch.Tensor or None
         Optional starting vector. Small perturbation added automatically.
-    deflate_basis : torch.Tensor or None
-        (N, d) orthonormal columns to deflate from every vector and residual.
+    deflate_basis : array-like or None
+        (N, d) columns to deflate. Orthonormalized internally via QR.
         Use to skip the trivial diffusion-map mode (lambda=1).
     breakdown_tol : float
         Treat beta below this as lucky breakdown.
@@ -80,8 +81,11 @@ def gpu_irlm_dense_qr(
     reorth_passes : int
         Number of MGS passes. 2 is standard.
     block_rows : int
-        Row-block size for basis rotation to limit peak VRAM.
-        Default 262144 rows (~30MB per block at float32, keep=30).
+        Row-block size for basis rotation and orthogonality check.
+        Limits peak VRAM. Default 262144.
+    compute_true_residuals : bool
+        If True (default), compute ||A v_i - lam_i v_i|| at the end via
+        k extra matvecs. Set False for production benchmarking.
     return_info : bool
         If True, return diagnostics dict as third element.
     return_torch : bool
@@ -95,21 +99,27 @@ def gpu_irlm_dense_qr(
 
     Notes
     -----
-    Key fixes over original draft:
-      1. Retained block tridiagonalization via scipy Hessenberg (symmetric
-         Hessenberg = tridiagonal). Dense QR leaves Tkeep dense; extracting
-         only the tridiagonal part was incorrect and broke the Lanczos
-         three-term recurrence after restart.
-      2. Implicit restart residual mode removed (raises NotImplementedError)
-         until bookkeeping for the extra Hessenberg rotation is implemented.
-         Explicit mode (one fresh matvec per restart) is the only option.
-      3. state_valid bookkeeping: if restart mutation fails mid-way, final
-         extraction falls back to the last complete valid cycle result.
-      4. True residuals computed at the end via explicit matvec for diagnostics.
-      5. Orthogonality error tracked per cycle.
-      6. Blocked basis rotation for large N to limit peak VRAM.
-      7. Optional deflation basis for known subspaces (e.g. trivial mode).
-      8. Warning when tol is below reliable float32 precision.
+    Changes in this version:
+      1. TF32 disabled for all GEMM ops (correctness on Ampere/Blackwell).
+         TF32 has ~10-bit mantissa; Lanczos orthogonality accumulates
+         ~1e-3 error per step with TF32, defeating double MGS.
+      2. Blocked orthogonality error: Q.T@Q accumulates in (m,m) blocks,
+         no float64 copy of the full (N,m) basis. OOM-safe at large N.
+      3. deflate_basis pre-processed once at setup: cast to device/dtype,
+         QR-orthonormalized defensively, shape-checked. Projection is then
+         a simple GEMV/GEMM with no per-call .to() overhead.
+      4. compute_true_residuals=False skips k end-of-solve matvecs for
+         production benchmarking.
+      5. Re-deflate residual after orthogonalization against retained basis,
+         then one more orthogonalization pass to clean up any leaked component.
+      Previous fixes retained:
+      - Real retained-block tridiagonalization via scipy Hessenberg.
+      - Explicit restart residual only (implicit mode removed).
+      - state_valid fallback if restart mutation fails.
+      - alpha not updated inside reortho loop.
+      - q0 warm-start perturbation.
+      - Blocked basis rotation.
+      - Formula + true residual diagnostics.
     """
     if not _TORCH_AVAILABLE:
         raise ImportError("torch required for gpu_irlm_dense_qr")
@@ -153,8 +163,22 @@ def gpu_irlm_dense_qr(
     if keep > ncv - 2:
         raise ValueError(f"keep={keep} must be <= ncv-2={ncv-2}")
 
+    # ── Save and set precision flags ───────────────────────────────────────
+    # FIX 1: Disable TF32 for correctness on Ampere/Blackwell.
+    # TF32 GEMM has ~10-bit mantissa vs float32's 23 bits.
+    # Lanczos orthogonality accumulates ~1e-3 error per step with TF32,
+    # which defeats double MGS reorthogonalization for clustered spectra.
     grad_state = torch.is_grad_enabled()
     torch.set_grad_enabled(False)
+
+    if device.type == "cuda":
+        old_tf32_matmul = torch.backends.cuda.matmul.allow_tf32
+        old_tf32_cudnn  = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32       = False
+    else:
+        old_tf32_matmul = None
+        old_tf32_cudnn  = None
 
     t_start = time.perf_counter()
 
@@ -165,17 +189,40 @@ def gpu_irlm_dense_qr(
             f"dtype={dtype}  small_dtype={small_dtype}  device={device}"
         )
 
+    # ── FIX 3: Pre-process deflation basis once ────────────────────────────
+    # Cast to device/dtype, QR-orthonormalize defensively, shape-check.
+    # Projection is then a simple GEMV with no per-call .to() overhead.
+    # The QR step is necessary (not just defensive): if the user passes a
+    # non-orthonormal basis the projection v - B@(B.T@v) is wrong.
+    if deflate_basis is not None:
+        B_def = torch.as_tensor(
+            deflate_basis if isinstance(deflate_basis, torch.Tensor)
+            else np.asarray(deflate_basis),
+            device=device, dtype=dtype,
+        )
+        if B_def.ndim == 1:
+            B_def = B_def[:, None]
+        if B_def.shape[0] != N:
+            raise ValueError(
+                f"deflate_basis has {B_def.shape[0]} rows, expected N={N}"
+            )
+        B_def, _ = torch.linalg.qr(B_def, mode="reduced")   # orthonormalize
+        if verbose:
+            print(f"  deflate_basis: {B_def.shape[1]} direction(s)")
+    else:
+        B_def = None
+
     # ──────────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────────
 
-    def _project_deflation(v):
-        if deflate_basis is None:
+    def _project_deflation(v: torch.Tensor) -> torch.Tensor:
+        """Remove B_def components from v. B_def pre-orthonormalized."""
+        if B_def is None:
             return v
-        B = deflate_basis.to(device=device, dtype=dtype)
-        return v - B @ (B.T @ v)
+        return v - B_def @ (B_def.T @ v)
 
-    def _make_initial_vector():
+    def _make_initial_vector() -> torch.Tensor:
         if q0 is not None:
             q = torch.as_tensor(q0, device=device, dtype=dtype).reshape(-1)
             if q.numel() != N:
@@ -190,7 +237,8 @@ def gpu_irlm_dense_qr(
             raise ValueError("Initial vector zero after deflation")
         return q / qn
 
-    def _orthogonalize(Qbasis, v, passes=2):
+    def _orthogonalize(Qbasis: torch.Tensor, v: torch.Tensor,
+                       passes: int = 2) -> torch.Tensor:
         if Qbasis.numel() == 0:
             return v
         for _ in range(passes):
@@ -198,20 +246,22 @@ def gpu_irlm_dense_qr(
             v = v - Qbasis @ c
         return v
 
-    def _build_T(alpha, beta, m):
+    def _build_T(alpha: torch.Tensor, beta: torch.Tensor,
+                 m: int) -> torch.Tensor:
         T = torch.diag(alpha[:m].to(device=device, dtype=small_dtype))
         if m > 1:
             b = beta[:m - 1].to(device=device, dtype=small_dtype)
             T = T + torch.diag(b, 1) + torch.diag(b, -1)
         return 0.5 * (T + T.T)
 
-    def _small_eigh_desc(T):
+    def _small_eigh_desc(T: torch.Tensor):
         T = 0.5 * (T + T.T)
         evals, evecs = torch.linalg.eigh(T)
         idx = torch.argsort(evals, descending=True)
         return evals[idx], evecs[:, idx]
 
-    def _implicit_shifted_qr_dense(T, shifts):
+    def _implicit_shifted_qr_dense(T: torch.Tensor,
+                                    shifts: torch.Tensor):
         m  = T.shape[0]
         I  = torch.eye(m, device=device, dtype=small_dtype)
         Tw = T.clone().to(small_dtype)
@@ -231,28 +281,24 @@ def gpu_irlm_dense_qr(
             Z  = Z @ Qs
         return Tw, Z
 
-    def _tridiagonalize_retained_block(Qkeep, Tkeep):
+    def _tridiagonalize_retained_block(Qkeep: torch.Tensor,
+                                        Tkeep: torch.Tensor):
         """
-        KEY FIX (point 1): After dense shifted QR, Tkeep is generally dense.
-        Use scipy Hessenberg reduction (symmetric Hessenberg = tridiagonal)
-        to restore the three-term Lanczos recurrence.
-
-        scipy returns (H, S) with T = S @ H @ S.T, i.e. H = S.T @ T @ S.
-        We rotate Qkeep <- Qkeep @ S so the Lanczos relation stays valid.
+        After dense shifted QR the retained block Tkeep is generally dense.
+        Restore the Lanczos three-term recurrence via scipy Hessenberg
+        (symmetric Hessenberg = tridiagonal). Rotate Qkeep accordingly.
         Cost: O(keep^3) on CPU — negligible.
         """
         T_np = Tkeep.detach().cpu().numpy().astype(np.float64)
         T_np = 0.5 * (T_np + T_np.T)
-
         H_np, S_np = scipy.linalg.hessenberg(T_np, calc_q=True)
         H_np = 0.5 * (H_np + H_np.T)
 
-        # Zero numerical off-tridiagonal noise explicitly.
-        r    = H_np.shape[0]
+        r     = H_np.shape[0]
         H_tri = np.zeros_like(H_np)
         np.fill_diagonal(H_tri, np.diag(H_np))
         if r > 1:
-            off = 0.5 * (np.diag(H_np, 1) + np.diag(H_np, -1))
+            off    = 0.5 * (np.diag(H_np, 1) + np.diag(H_np, -1))
             H_tri += np.diag(off, 1) + np.diag(off, -1)
 
         S     = torch.from_numpy(S_np).to(device=device, dtype=dtype)
@@ -260,7 +306,6 @@ def gpu_irlm_dense_qr(
 
         H = torch.from_numpy(H_tri).to(device=device, dtype=small_dtype)
 
-        # Canonicalize: nonneg subdiagonal.
         for i in range(r - 1):
             if float(H[i + 1, i].cpu()) < 0:
                 Qkeep[:, i + 1].mul_(-1)
@@ -269,33 +314,44 @@ def gpu_irlm_dense_qr(
 
         alpha_new = torch.diagonal(H).clone().to(small_dtype)
         beta_new  = (torch.diagonal(H, offset=-1).clone().abs().to(small_dtype)
-                     if r > 1 else torch.empty(0, device=device, dtype=small_dtype))
-
+                     if r > 1 else
+                     torch.empty(0, device=device, dtype=small_dtype))
         return Qkeep, alpha_new, beta_new, H
 
-    def _rotate_basis_blocked(m, Z_keep, keep_eff):
-        """Blocked Q[:,:m] @ Z_keep to limit peak VRAM at large N."""
+    def _rotate_basis_blocked(m: int, Z_keep: torch.Tensor,
+                               keep_eff: int) -> torch.Tensor:
+        """Blocked Q[:,:m] @ Z_keep — avoids one large (N,keep) temporary."""
         Qout = torch.empty((N, keep_eff), device=device, dtype=dtype)
         for lo in range(0, N, block_rows):
             hi = min(lo + block_rows, N)
             Qout[lo:hi] = Q[lo:hi, :m] @ Z_keep
         return Qout
 
-    def _true_residuals(vals_t, vecs_t):
-        """||A v_i - lam_i v_i|| via explicit matvec. Diagnostics only."""
+    def _orth_error_blocked(Qblock: torch.Tensor) -> float:
+        """
+        FIX 2: ||Q.T Q - I||_F / ncols via blocked accumulation.
+        Avoids creating a float64 copy of the full (N, m) basis.
+        At N=10M, m=64: naive cast uses 5.1 GB; this uses ~30 MB per block.
+        """
+        r = Qblock.shape[1]
+        G = torch.zeros((r, r), device=device, dtype=small_dtype)
+        for lo in range(0, Qblock.shape[0], block_rows):
+            hi = min(lo + block_rows, Qblock.shape[0])
+            B  = Qblock[lo:hi].to(dtype=small_dtype)
+            G += B.T @ B
+        I = torch.eye(r, device=device, dtype=small_dtype)
+        return float((torch.linalg.norm(G - I) / max(1, r)).cpu())
+
+    def _true_residuals(vals_t: torch.Tensor,
+                        vecs_t: torch.Tensor) -> np.ndarray:
+        """||A v_i - lam_i v_i|| via explicit matvec. k extra matvecs."""
         out = []
         for i in range(vals_t.numel()):
             Av = matvec_fn(vecs_t[:, i])
-            r  = Av.to(device=device, dtype=dtype) \
-                 - vals_t[i].to(dtype=dtype) * vecs_t[:, i]
+            r  = (Av.to(device=device, dtype=dtype)
+                  - vals_t[i].to(dtype=dtype) * vecs_t[:, i])
             out.append(float(torch.linalg.norm(r).cpu()))
         return np.array(out, dtype=np.float64)
-
-    def _orth_error(Qblock):
-        """||Q.T Q - I||_F / ncols. Stays near machine eps if healthy."""
-        G = Qblock.T @ Qblock
-        I = torch.eye(G.shape[0], device=device, dtype=G.dtype)
-        return float((torch.linalg.norm(G - I) / max(1, G.shape[0])).cpu())
 
     # ──────────────────────────────────────────────────────────────────────
     # Persistent GPU state
@@ -318,16 +374,16 @@ def gpu_irlm_dense_qr(
     best_m              = None
     best_beta_last      = None
 
-    off_tridiag_history = []
-    restart_beta_history= []
-    orth_error_history  = []
+    off_tridiag_history  = []
+    restart_beta_history = []
+    orth_error_history   = []
 
     start_col           = 0
     m_final             = 1
     beta_last           = torch.tensor(0.0, device=device, dtype=small_dtype)
     has_residual_vector = False
 
-    def _expand_from(start_col_local):
+    def _expand_from(start_col_local: int):
         nonlocal n_matvec
         beta_last_local = torch.tensor(0.0, device=device, dtype=small_dtype)
         has_residual    = False
@@ -347,7 +403,7 @@ def gpu_irlm_dense_qr(
             if j > 0:
                 z = z - beta[j - 1].to(dtype=dtype) * Q[:, j - 1]
 
-            # Diagonal coeff — set before reortho, NOT updated inside loop.
+            # Diagonal coeff set before reortho; NOT updated inside loop.
             aj = torch.dot(qj, z).to(small_dtype)
             z  = z - aj.to(dtype=dtype) * qj
 
@@ -398,7 +454,7 @@ def gpu_irlm_dense_qr(
                 thresholds = torch.full_like(residuals, float(tol))
 
             n_conv   = int(torch.sum(residuals <= thresholds).cpu())
-            orth_err = _orth_error(Q[:, :m].to(small_dtype))
+            orth_err = _orth_error_blocked(Q[:, :m])   # FIX 2
             orth_error_history.append(orth_err)
 
             best_evals     = evals_all
@@ -407,16 +463,20 @@ def gpu_irlm_dense_qr(
             best_beta_last = beta_last
 
             if verbose:
-                max_res = float(torch.max(residuals).cpu()) if residuals.numel() else float("nan")
+                max_res = (float(torch.max(residuals).cpu())
+                           if residuals.numel() else float("nan"))
                 print(
                     f"  cycle={cycle:02d}  m={m:4d}  "
                     f"beta={float(beta_last.cpu()):.3e}  "
                     f"converged={n_conv}/{n_take}  "
                     f"max_res={max_res:.3e}  orth={orth_err:.2e}"
                 )
-                print(f"    theta[:5] = {evals_k[:min(5,len(evals_k))].cpu().numpy()}")
+                print(f"    theta[:5] = "
+                      f"{evals_k[:min(5,len(evals_k))].cpu().numpy()}")
 
-            if n_take >= k and bool(torch.all(residuals[:k] <= thresholds[:k]).cpu()):
+            if n_take >= k and bool(
+                torch.all(residuals[:k] <= thresholds[:k]).cpu()
+            ):
                 converged = True
                 if verbose:
                     print(f"[irlm] converged after cycle={cycle}")
@@ -452,35 +512,36 @@ def gpu_irlm_dense_qr(
             Tk = T_shifted[:keep_eff, :keep_eff]
             Tk_tri = torch.diag(torch.diagonal(Tk))
             if keep_eff > 1:
-                off = 0.5 * (torch.diagonal(Tk, 1) + torch.diagonal(Tk, -1))
+                off    = 0.5 * (torch.diagonal(Tk, 1) + torch.diagonal(Tk, -1))
                 Tk_tri = Tk_tri + torch.diag(off, 1) + torch.diag(off, -1)
-            denom  = max(float(torch.linalg.norm(Tk).cpu()), 1e-300)
-            off_rel= float(torch.linalg.norm(Tk - Tk_tri).cpu()) / denom
+            denom   = max(float(torch.linalg.norm(Tk).cpu()), 1e-300)
+            off_rel = float(torch.linalg.norm(Tk - Tk_tri).cpu()) / denom
             off_tridiag_history.append(off_rel)
 
-            # Blocked basis rotation.
             Z_keep = Z[:, :keep_eff].to(dtype=dtype)
             Qkeep  = _rotate_basis_blocked(m, Z_keep, keep_eff)
             Tkeep  = T_shifted[:keep_eff, :keep_eff]
 
-            # Mark state invalid before mutating.
-            state_valid = False
+            state_valid = False   # mark invalid before mutation
 
-            # KEY FIX: tridiagonalize retained block via Hessenberg.
             Qkeep, alpha_new, beta_new, Tkeep_tri = \
                 _tridiagonalize_retained_block(Qkeep, Tkeep)
 
-            # Explicit restart residual (only supported mode).
+            # Explicit restart residual.
             qlast = Qkeep[:, keep_eff - 1]
             r     = matvec_fn(qlast).to(device=device, dtype=dtype).reshape(-1)
-            r     = _project_deflation(r)
             n_matvec += 1
 
+            r = _project_deflation(r)
             r = r - alpha_new[keep_eff - 1].to(dtype=dtype) * qlast
             if keep_eff > 1:
                 r = r - beta_new[keep_eff - 2].to(dtype=dtype) * Qkeep[:, keep_eff - 2]
 
+            # FIX 5: re-deflate and clean up after orthogonalization.
             r = _orthogonalize(Qkeep, r, passes=reorth_passes)
+            r = _project_deflation(r)           # remove any leaked deflation component
+            r = _orthogonalize(Qkeep, r, passes=1)   # one final cleanup pass
+
             beta_restart = torch.linalg.norm(r).to(small_dtype)
             restart_beta_history.append(float(beta_restart.cpu()))
 
@@ -501,7 +562,7 @@ def gpu_irlm_dense_qr(
                 beta[:keep_eff - 1] = beta_new
             beta[keep_eff - 1]  = beta_restart
             start_col           = keep_eff
-            state_valid         = True      # install complete
+            state_valid         = True       # install complete
 
             if verbose:
                 print(
@@ -519,11 +580,11 @@ def gpu_irlm_dense_qr(
             Tfinal           = _build_T(alpha, beta, m_final)
             evals_f, evecs_f = _small_eigh_desc(Tfinal)
         else:
-            # Restart failed mid-way — use last complete cycle.
+            # Restart failed mid-way — fall back to last complete cycle.
             evals_f  = best_evals
             evecs_f  = best_evecs
             m_final  = best_m
-            beta_last= best_beta_last
+            beta_last = best_beta_last
 
         n_return  = min(k, m_final)
         vals      = evals_f[:n_return]
@@ -533,19 +594,26 @@ def gpu_irlm_dense_qr(
             ritz_vecs, dim=0).clamp_min(torch.finfo(dtype).eps)
 
         formula_res = torch.abs(beta_last * evecs_f[-1, :n_return])
-        true_res    = _true_residuals(vals, ritz_vecs)
+
+        # FIX 4: true residuals are optional — skip in production.
+        if compute_true_residuals:
+            true_res = _true_residuals(vals, ritz_vecs)
+        else:
+            true_res = None
 
         elapsed = time.perf_counter() - t_start
 
         if verbose:
             print(
-                f"[irlm] done  converged={converged}  breakdown={breakdown}  "
-                f"state_valid={state_valid}  cycles={cycles_done}  "
-                f"matvecs={n_matvec}  time={elapsed:.2f}s"
+                f"[irlm] done  converged={converged}  "
+                f"breakdown={breakdown}  state_valid={state_valid}  "
+                f"cycles={cycles_done}  matvecs={n_matvec}  "
+                f"time={elapsed:.2f}s"
             )
             print(f"  eigenvalues:       {vals.cpu().numpy()}")
             print(f"  formula residuals: {formula_res.cpu().numpy()}")
-            print(f"  true residuals:    {true_res}")
+            if true_res is not None:
+                print(f"  true residuals:    {true_res}")
 
         if return_torch:
             vals_out, vecs_out = vals, ritz_vecs
@@ -582,4 +650,81 @@ def gpu_irlm_dense_qr(
         return vals_out, vecs_out
 
     finally:
+        # Restore all saved state unconditionally.
         torch.set_grad_enabled(grad_state)
+        if old_tf32_matmul is not None:
+            torch.backends.cuda.matmul.allow_tf32 = old_tf32_matmul
+            torch.backends.cudnn.allow_tf32       = old_tf32_cudnn
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Drop-in compatibility shim for eigensolver_gpu.py
+# Matches the signature of the original gpu_lanczos() exactly.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def gpu_lanczos(
+    matvec_fn,
+    N:        int,
+    k:        int   = 8,
+    n_iter:   int   = None,
+    tol:      float = 1e-6,
+    dtype           = None,
+    device:   str   = "cuda",
+    verbose:  bool  = True,
+    q0=None,
+    **kwargs,
+):
+    """
+    Drop-in replacement for the original gpu_lanczos() in eigensolver_gpu.py.
+
+    Translates n_iter -> ncv for gpu_irlm_dense_qr.
+    All other original parameters are forwarded unchanged.
+    Extra IRLM parameters (keep, max_restarts, etc.) can be passed via kwargs.
+
+    Parameters
+    ----------
+    n_iter : int or None
+        Maps to ncv (Krylov subspace size) in IRLM.
+        Default behaviour is identical: None -> min(N, max(4k+40, k+20)).
+
+    Returns
+    -------
+    vals : np.ndarray, shape (k,)  — descending eigenvalues
+    vecs : np.ndarray, shape (N, k) — corresponding Ritz vectors
+    """
+    return gpu_irlm_dense_qr(
+        matvec_fn,
+        N             = N,
+        k             = k,
+        ncv           = n_iter,   # n_iter in plain Lanczos = ncv in IRLM
+        tol           = tol,
+        dtype         = dtype,
+        device        = device,
+        verbose       = verbose,
+        q0            = q0,
+        # production defaults: skip true residuals (saves k matvecs)
+        compute_true_residuals = kwargs.pop("compute_true_residuals", False),
+        **kwargs,
+    )
+
+
+def make_gpu_matvec(state, ext_module):
+    """
+    Unchanged from eigensolver_gpu.py — wrap CUDAState + ext into GPU matvec.
+    Kept here so this file is a complete drop-in replacement.
+    """
+    try:
+        import torch
+    except ImportError:
+        raise ImportError("torch required")
+
+    def matvec_gpu(v):
+        with torch.no_grad():
+            return ext_module.matvec(
+                state.X_fp16,
+                v,
+                state.rscale,
+                state.sq_X,
+                state.beta,
+            )
+    return matvec_gpu
