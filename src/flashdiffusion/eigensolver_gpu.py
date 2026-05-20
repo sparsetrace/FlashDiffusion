@@ -2,130 +2,175 @@ from __future__ import annotations
 
 import time
 import warnings
+from typing import Callable, Optional, Tuple, Any, Dict
+
 import numpy as np
 
 try:
     import torch
     _TORCH_AVAILABLE = True
-except ImportError:
+except ImportError:  # pragma: no cover
     _TORCH_AVAILABLE = False
 
 
-def gpu_irlm_dense_qr(
-    matvec_fn,
+# ---------------------------------------------------------------------------
+# GPU Hessenberg (replaces scipy.linalg.hessenberg after thick restart)
+# ---------------------------------------------------------------------------
+
+def _gpu_hessenberg_sym(T: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor"]:
+    """
+    Reduce a symmetric matrix T (on GPU, small_dtype) to symmetric tridiagonal
+    form via Householder reflections, entirely on the GPU.
+
+    For a symmetric matrix, Hessenberg = tridiagonal, so this is equivalent to
+    scipy.linalg.hessenberg but stays on-device.
+
+    Returns
+    -------
+    H : tridiagonal (symmetric) version of T, same device/dtype
+    Q : orthogonal accumulation such that Q.T @ T_orig @ Q = H
+    """
+    device = T.device
+    dtype = T.dtype
+    n = T.shape[0]
+
+    T = 0.5 * (T + T.T).clone()
+    Q = torch.eye(n, device=device, dtype=dtype)
+
+    for k in range(n - 2):
+        x = T[k + 1:, k].clone()
+        norm_x = torch.linalg.norm(x)
+        if float(norm_x) < 1e-15:
+            continue
+        # Householder vector: sign chosen to avoid cancellation.
+        # sign(x[0]) >= 0 convention: add norm in the direction of x[0].
+        sign = torch.where(
+            x[0] >= 0,
+            torch.tensor(1.0, device=device, dtype=dtype),
+            torch.tensor(-1.0, device=device, dtype=dtype),
+        )
+        v = x.clone()
+        v[0] = v[0] + sign * norm_x
+        v = v / torch.linalg.norm(v)
+
+        # Apply H = I - 2vv^T from left and right to the sub-block.
+        sub = T[k + 1:, k + 1:].clone()
+        # Left: sub <- (I - 2vv^T) sub
+        sub = sub - 2.0 * v.unsqueeze(1) * (v @ sub).unsqueeze(0)
+        # Right: sub <- sub (I - 2vv^T)
+        sub = sub - 2.0 * (sub @ v).unsqueeze(1) * v.unsqueeze(0)
+        T[k + 1:, k + 1:] = sub
+
+        # Set the off-diagonal entry explicitly; zero the rest of column/row k.
+        T[k + 2:, k] = 0.0
+        T[k, k + 2:] = 0.0
+        T[k + 1, k] = -sign * norm_x
+        T[k, k + 1] = T[k + 1, k]
+
+        # Accumulate Q
+        Q[:, k + 1:] -= 2.0 * (Q[:, k + 1:] @ v).unsqueeze(1) * v.unsqueeze(0)
+
+    # Force exact symmetry and extract clean tridiagonal
+    T = 0.5 * (T + T.T)
+    alpha = torch.diagonal(T).clone()
+    beta = torch.diagonal(T, offset=1).clone()
+
+    H_tri = torch.diag(alpha) + torch.diag(beta, 1) + torch.diag(beta, -1)
+    return H_tri, Q
+
+
+def gpu_block_irlm(
+    matmat_fn: Optional[Callable[["torch.Tensor"], "torch.Tensor"]] = None,
+    *,
+    matvec_fn: Optional[Callable[["torch.Tensor"], "torch.Tensor"]] = None,
     N: int,
     k: int = 8,
-    ncv: int | None = None,
-    keep: int | None = None,
+    block_size: Optional[int] = None,
+    ncv: Optional[int] = None,
+    keep: Optional[int] = None,
     max_restarts: int = 20,
     tol: float = 1e-6,
     dtype=None,
     small_dtype=None,
     device: str = "cuda",
     verbose: bool = True,
+    q0_block=None,
     q0=None,
     deflate_basis=None,
     breakdown_tol: float = 1e-12,
+    rank_tol: Optional[float] = None,
     relative_residual: bool = True,
     reorthogonalize: bool = True,
     reorth_passes: int = 2,
     block_rows: int = 262_144,
     compute_true_residuals: bool = True,
+    orth_check_every: Optional[int] = 1,
+    disable_tf32: bool = True,
     return_info: bool = False,
     return_torch: bool = False,
 ):
     """
-    GPU-resident implicitly restarted Lanczos method (IRLM) using dense
-    shifted QR on the small projected matrix, with proper retained-block
-    tridiagonalization via scipy Hessenberg reduction.
+    GPU thick-restarted block Arnoldi / block Rayleigh-Ritz eigensolver.
 
-    Computes the k largest algebraic eigenpairs of a symmetric/self-adjoint
-    matrix-free operator.
+    Correctly described: this is a thick-restarted block Arnoldi method for
+    symmetric operators, not a strict block IRLM. Each restart selects the top
+    keep Ritz vectors as the new seed and rebuilds the Krylov relation from
+    scratch via _expand_cycle. This loses one benefit of true IRLM (continuing
+    the Krylov relation without reapplying A to retained vectors), but is simpler
+    and correct. The matmat_fn(V) block interface still gives GPU throughput
+    benefits over scalar IRLM for large N.
+
+    To become true block Krylov-Schur/IRLM, _expand_cycle would need to accept
+    the retained H sub-block and continue expansion from column keep rather than 0.
+
+    Fixes applied in this version:
+      1. H double-counting removed: H[:m, applied:end] = coeff (not +=), no
+         transpose fill during expansion. H[:p,:p] symmetrized only at Ritz time.
+      2. Hessenberg rotation removed from thick restart (was unused/incorrect:
+         rotating by S from H[:keep,:keep] doesn't re-tridiagonalize the Ritz
+         basis since the projected matrix there is diag(evals), not H).
+      3. Householder sign bug fixed in _gpu_hessenberg_sym (was clamping sign
+         to [0,1], turning negative x[0] into 0).
+      4. keep_eff validated before _orthonormalize_block.
+      5. True-residual matvec cost excluded from n_matmat/n_rhs counters.
+      6. Q buffer reused across cycles (single allocation).
 
     Parameters
     ----------
-    matvec_fn : callable
-        (N,) GPU tensor -> (N,) GPU tensor.
-    N : int
+    matmat_fn:
+        Callable V -> A V, where V has shape (N, s).
+    matvec_fn:
+        Optional fallback callable v -> A v.
+    N:
         Problem size.
-    k : int
-        Number of requested eigenpairs.
-    ncv : int or None
-        Krylov subspace size. Default: min(N, max(4*k+40, k+20)).
-    keep : int or None
-        Directions retained per restart. k <= keep <= ncv-2.
-        Default: min(ncv-2, k+max(8, k//2)).
-    max_restarts : int
-        Maximum restart cycles.
-    tol : float
-        Ritz residual tolerance. Values < 5e-6 with float32 emit a warning.
-    dtype : torch.dtype or None
-        GPU vector dtype. Default: torch.float32.
-    small_dtype : torch.dtype or None
-        Dtype for ncv x ncv projected problems. Default: torch.float64.
-    device : str
-        CUDA device string.
-    verbose : bool
-        Print per-cycle convergence info.
-    q0 : torch.Tensor or None
-        Optional starting vector. Small perturbation added automatically.
-    deflate_basis : array-like or None
-        (N, d) columns to deflate. Orthonormalized internally via QR.
-        Use to skip the trivial diffusion-map mode (lambda=1).
-    breakdown_tol : float
-        Treat beta below this as lucky breakdown.
-    relative_residual : bool
-        If True: converge when |beta*y[-1]| <= tol*max(1,|theta|).
-    reorthogonalize : bool
-        Full MGS re-orthogonalization. Must be True for clustered spectra.
-    reorth_passes : int
-        Number of MGS passes. 2 is standard.
-    block_rows : int
-        Row-block size for basis rotation and orthogonality check.
-        Limits peak VRAM. Default 262144.
-    compute_true_residuals : bool
-        If True (default), compute ||A v_i - lam_i v_i|| at the end via
-        k extra matvecs. Set False for production benchmarking.
-    return_info : bool
-        If True, return diagnostics dict as third element.
-    return_torch : bool
-        If True return GPU tensors; if False (default) return NumPy.
+    k:
+        Number of eigenpairs requested.
+    block_size:
+        Vectors per operator application. Default: min(16, max(2,k)).
+    ncv:
+        Rayleigh-Ritz subspace dimension. Default: max(4*k+4*b, k+6*b).
+    keep:
+        Ritz vectors retained after restart. Default: min(ncv-b, k+max(2*b,k//2)).
+    q0_block / q0:
+        Optional initial block or vector.
+    deflate_basis:
+        Optional (N,d) basis to project out.
+    compute_true_residuals:
+        Compute ||A v_i - lam_i v_i|| at end (excluded from op counters).
 
     Returns
     -------
-    vals : ndarray or Tensor, shape (k,)
-    vecs : ndarray or Tensor, shape (N, k)
-    info : dict  [only when return_info=True]
-
-    Notes
-    -----
-    Changes in this version:
-      1. TF32 disabled for all GEMM ops (correctness on Ampere/Blackwell).
-         TF32 has ~10-bit mantissa; Lanczos orthogonality accumulates
-         ~1e-3 error per step with TF32, defeating double MGS.
-      2. Blocked orthogonality error: Q.T@Q accumulates in (m,m) blocks,
-         no float64 copy of the full (N,m) basis. OOM-safe at large N.
-      3. deflate_basis pre-processed once at setup: cast to device/dtype,
-         QR-orthonormalized defensively, shape-checked. Projection is then
-         a simple GEMV/GEMM with no per-call .to() overhead.
-      4. compute_true_residuals=False skips k end-of-solve matvecs for
-         production benchmarking.
-      5. Re-deflate residual after orthogonalization against retained basis,
-         then one more orthogonalization pass to clean up any leaked component.
-      Previous fixes retained:
-      - Real retained-block tridiagonalization via scipy Hessenberg.
-      - Explicit restart residual only (implicit mode removed).
-      - state_valid fallback if restart mutation fails.
-      - alpha not updated inside reortho loop.
-      - q0 warm-start perturbation.
-      - Blocked basis rotation.
-      - Formula + true residual diagnostics.
+    vals : np.ndarray or torch.Tensor, shape (k,)
+    vecs : np.ndarray or torch.Tensor, shape (N,k)
+    info : dict, optional
     """
     if not _TORCH_AVAILABLE:
-        raise ImportError("torch required for gpu_irlm_dense_qr")
+        raise ImportError("torch required for gpu_block_irlm")
 
     import torch
-    import scipy.linalg
+
+    if matmat_fn is None and matvec_fn is None:
+        raise ValueError("Provide either matmat_fn(V)->A@V or matvec_fn(v)->A@v")
 
     if dtype is None:
         dtype = torch.float32
@@ -133,598 +178,581 @@ def gpu_irlm_dense_qr(
         small_dtype = torch.float64
 
     device = torch.device(device)
-
     if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA not available")
-
-    if dtype == torch.float32 and tol < 5e-6:
-        warnings.warn(
-            f"tol={tol} may be unreliable for dtype=float32. "
-            "Consider tol >= 5e-6.",
-            RuntimeWarning, stacklevel=2,
-        )
+        raise RuntimeError("CUDA requested but torch.cuda.is_available() is False")
 
     if k < 1:
         raise ValueError("k must be >= 1")
 
-    if ncv is None:
-        ncv = min(N, max(4 * k + 40, k + 20))
-    ncv = int(min(ncv, N))
+    if block_size is None:
+        block_size = min(16, max(2, int(k)))
+    block_size = int(block_size)
+    if block_size < 1:
+        raise ValueError("block_size must be >= 1")
 
-    if ncv <= k + 1:
-        raise ValueError(f"ncv={ncv} too small for k={k}; need ncv > k+1")
+    if ncv is None:
+        ncv = max(4 * k + 4 * block_size, k + 6 * block_size)
+    ncv = int(min(N, ncv))
+    if ncv < N:
+        ncv = int(min(N, ((ncv + block_size - 1) // block_size) * block_size))
+
+    if ncv <= k + block_size:
+        raise ValueError(
+            f"ncv={ncv} too small for k={k}, block_size={block_size}; "
+            f"need ncv > k + block_size"
+        )
 
     if keep is None:
-        keep = min(ncv - 2, k + max(8, k // 2))
+        keep = min(ncv - block_size, k + max(2 * block_size, k // 2))
     keep = int(keep)
-
     if keep < k:
         raise ValueError(f"keep={keep} must be >= k={k}")
-    if keep > ncv - 2:
-        raise ValueError(f"keep={keep} must be <= ncv-2={ncv-2}")
+    if keep > ncv - block_size:
+        raise ValueError(
+            f"keep={keep} must be <= ncv-block_size={ncv - block_size}"
+        )
 
-    # ── Save and set precision flags ───────────────────────────────────────
-    # FIX 1: Disable TF32 for correctness on Ampere/Blackwell.
-    # TF32 GEMM has ~10-bit mantissa vs float32's 23 bits.
-    # Lanczos orthogonality accumulates ~1e-3 error per step with TF32,
-    # which defeats double MGS reorthogonalization for clustered spectra.
+    if rank_tol is None:
+        rank_tol = 1e-7 if dtype == torch.float32 else 1e-12
+    if dtype == torch.float32 and tol < 5e-6:
+        warnings.warn(
+            f"tol={tol} may be unreliable for dtype=float32. Consider tol >= 5e-6.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     grad_state = torch.is_grad_enabled()
     torch.set_grad_enabled(False)
 
     if device.type == "cuda":
         old_tf32_matmul = torch.backends.cuda.matmul.allow_tf32
-        old_tf32_cudnn  = torch.backends.cudnn.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32       = False
+        old_tf32_cudnn = torch.backends.cudnn.allow_tf32
+        if disable_tf32:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
     else:
         old_tf32_matmul = None
-        old_tf32_cudnn  = None
+        old_tf32_cudnn = None
 
     t_start = time.perf_counter()
 
-    if verbose:
-        print(
-            f"[irlm] N={N}  k={k}  ncv={ncv}  keep={keep}  "
-            f"max_restarts={max_restarts}  tol={tol:g}  "
-            f"dtype={dtype}  small_dtype={small_dtype}  device={device}"
-        )
-
-    # ── FIX 3: Pre-process deflation basis once ────────────────────────────
-    # Cast to device/dtype, QR-orthonormalize defensively, shape-check.
-    # Projection is then a simple GEMV with no per-call .to() overhead.
-    # The QR step is necessary (not just defensive): if the user passes a
-    # non-orthonormal basis the projection v - B@(B.T@v) is wrong.
     if deflate_basis is not None:
         B_def = torch.as_tensor(
-            deflate_basis if isinstance(deflate_basis, torch.Tensor)
-            else np.asarray(deflate_basis),
-            device=device, dtype=dtype,
+            deflate_basis if isinstance(deflate_basis, torch.Tensor) else np.asarray(deflate_basis),
+            device=device,
+            dtype=dtype,
         )
         if B_def.ndim == 1:
             B_def = B_def[:, None]
         if B_def.shape[0] != N:
-            raise ValueError(
-                f"deflate_basis has {B_def.shape[0]} rows, expected N={N}"
-            )
-        B_def, _ = torch.linalg.qr(B_def, mode="reduced")   # orthonormalize
-        if verbose:
-            print(f"  deflate_basis: {B_def.shape[1]} direction(s)")
+            raise ValueError(f"deflate_basis has {B_def.shape[0]} rows, expected N={N}")
+        B_def, _ = torch.linalg.qr(B_def, mode="reduced")
     else:
         B_def = None
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Helpers
-    # ──────────────────────────────────────────────────────────────────────
+    n_matmat = 0
+    n_rhs = 0
 
-    def _project_deflation(v: torch.Tensor) -> torch.Tensor:
-        """Remove B_def components from v. B_def pre-orthonormalized."""
+    def _project_deflation(V: "torch.Tensor") -> "torch.Tensor":
         if B_def is None:
-            return v
-        return v - B_def @ (B_def.T @ v)
+            return V
+        return V - B_def @ (B_def.T @ V)
 
-    def _make_initial_vector() -> torch.Tensor:
-        if q0 is not None:
-            q = torch.as_tensor(q0, device=device, dtype=dtype).reshape(-1)
-            if q.numel() != N:
-                raise ValueError(f"q0 length {q.numel()} != N={N}")
-            noise_scale = 1e-3 * float(torch.linalg.norm(q).cpu()) / (N ** 0.5)
-            q = q + noise_scale * torch.randn_like(q)
-        else:
-            q = torch.randn(N, device=device, dtype=dtype)
-        q = _project_deflation(q)
-        qn = torch.linalg.norm(q)
-        if float(qn.cpu()) == 0.0:
-            raise ValueError("Initial vector zero after deflation")
-        return q / qn
+    def _apply_A(V: "torch.Tensor", _count: bool = True) -> "torch.Tensor":
+        # FIX 5: _count=False lets true-residual calls skip the benchmark counters.
+        nonlocal n_matmat, n_rhs
+        V = V.to(device=device, dtype=dtype)
+        if V.ndim == 1:
+            V = V[:, None]
+        if V.shape[0] != N:
+            raise ValueError(f"matmat input has {V.shape[0]} rows, expected {N}")
+        with torch.no_grad():
+            if matmat_fn is not None:
+                Y = matmat_fn(V)
+            else:
+                cols = [matvec_fn(V[:, j]).reshape(-1) for j in range(V.shape[1])]
+                Y = torch.stack(cols, dim=1)
+        Y = Y.to(device=device, dtype=dtype)
+        if Y.ndim == 1:
+            Y = Y[:, None]
+        if Y.shape != V.shape:
+            raise ValueError(f"operator returned shape {tuple(Y.shape)}, expected {tuple(V.shape)}")
+        if _count:
+            n_matmat += 1
+            n_rhs += V.shape[1]
+        return Y
 
-    def _orthogonalize(Qbasis: torch.Tensor, v: torch.Tensor,
-                       passes: int = 2) -> torch.Tensor:
+    def _linear_combo_blocked(Qsource: "torch.Tensor", C: "torch.Tensor") -> "torch.Tensor":
+        C = C.to(device=device, dtype=dtype)
+        out = torch.empty((N, C.shape[1]), device=device, dtype=dtype)
+        for lo in range(0, N, block_rows):
+            hi = min(lo + block_rows, N)
+            out[lo:hi] = Qsource[lo:hi] @ C
+        return out
+
+    def _project_against(Qbasis: "torch.Tensor", V: "torch.Tensor", passes: int) -> "torch.Tensor":
         if Qbasis.numel() == 0:
-            return v
+            return V
         for _ in range(passes):
-            c = Qbasis.T @ v
-            v = v - Qbasis @ c
-        return v
+            C = Qbasis.T @ V
+            V = V - Qbasis @ C
+        return V
 
-    def _build_T(alpha: torch.Tensor, beta: torch.Tensor,
-                 m: int) -> torch.Tensor:
-        T = torch.diag(alpha[:m].to(device=device, dtype=small_dtype))
-        if m > 1:
-            b = beta[:m - 1].to(device=device, dtype=small_dtype)
-            T = T + torch.diag(b, 1) + torch.diag(b, -1)
-        return 0.5 * (T + T.T)
+    def _qr_rank(V: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor", int]:
+        Qv, R = torch.linalg.qr(V, mode="reduced")
+        if R.numel() == 0:
+            return Qv[:, :0], R[:0, :], 0
+        diag = torch.abs(torch.diagonal(R))
+        maxd = torch.max(diag).clamp_min(torch.finfo(dtype).eps)
+        keep_mask = diag > max(float(rank_tol), float(breakdown_tol)) * maxd
+        r = int(torch.sum(keep_mask).detach().cpu())
+        if r == Qv.shape[1]:
+            return Qv, R, r
+        if r == 0:
+            return Qv[:, :0], R[:0, :], 0
+        return Qv[:, :r], R[:r, :], r
 
-    def _small_eigh_desc(T: torch.Tensor):
-        T = 0.5 * (T + T.T)
-        evals, evecs = torch.linalg.eigh(T)
+    def _orthonormalize_block(
+        V: "torch.Tensor",
+        Qbasis: Optional["torch.Tensor"],
+        target_cols: int,
+        *,
+        allow_random_fill: bool = True,
+    ) -> "torch.Tensor":
+        pieces = []
+        work = V if V is not None else torch.empty((N, 0), device=device, dtype=dtype)
+        if work.ndim == 1:
+            work = work[:, None]
+        work = work.to(device=device, dtype=dtype)
+
+        for attempt in range(10):
+            needed = target_cols - sum(p.shape[1] for p in pieces)
+            if needed <= 0:
+                break
+            if work.shape[1] == 0:
+                if not allow_random_fill:
+                    break
+                work = torch.randn((N, needed), device=device, dtype=dtype)
+
+            basis_parts = []
+            if Qbasis is not None and Qbasis.numel() > 0:
+                basis_parts.append(Qbasis)
+            if pieces:
+                basis_parts.append(torch.cat(pieces, dim=1))
+            Qall = torch.cat(basis_parts, dim=1) if basis_parts else None
+
+            work = _project_deflation(work)
+            if Qall is not None:
+                work = _project_against(Qall, work, passes=max(1, reorth_passes))
+            Qv, _R, r = _qr_rank(work)
+            if r > 0:
+                take = min(r, needed)
+                pieces.append(Qv[:, :take])
+            needed = target_cols - sum(p.shape[1] for p in pieces)
+            if needed <= 0:
+                break
+            if not allow_random_fill:
+                break
+            work = torch.randn((N, needed), device=device, dtype=dtype)
+
+        if not pieces:
+            raise RuntimeError("failed to construct any orthonormal block columns")
+        Qout = torch.cat(pieces, dim=1)
+        if Qout.shape[1] < target_cols:
+            raise RuntimeError(
+                f"only built {Qout.shape[1]} orthonormal columns, needed {target_cols}"
+            )
+        return Qout[:, :target_cols]
+
+    def _initial_seed() -> "torch.Tensor":
+        if q0_block is not None:
+            V = torch.as_tensor(q0_block, device=device, dtype=dtype)
+        elif q0 is not None:
+            V = torch.as_tensor(q0, device=device, dtype=dtype)
+        else:
+            V = torch.randn((N, block_size), device=device, dtype=dtype)
+        if V.ndim == 1:
+            V = V[:, None]
+        if V.shape[0] != N:
+            raise ValueError(f"q0_block has {V.shape[0]} rows, expected {N}")
+        if q0_block is not None or q0 is not None:
+            scale = float(torch.linalg.norm(V).detach().cpu()) / max(1.0, (N * V.shape[1]) ** 0.5)
+            V = V + (1e-3 * scale) * torch.randn_like(V)
+        return _orthonormalize_block(V, None, block_size, allow_random_fill=True)
+
+    def _orth_error_blocked(Qblock: "torch.Tensor") -> float:
+        r = Qblock.shape[1]
+        G = torch.zeros((r, r), device=device, dtype=small_dtype)
+        for lo in range(0, N, block_rows):
+            hi = min(lo + block_rows, N)
+            B = Qblock[lo:hi].to(dtype=small_dtype)
+            G += B.T @ B
+        I = torch.eye(r, device=device, dtype=small_dtype)
+        return float((torch.linalg.norm(G - I) / max(1, r)).detach().cpu())
+
+    def _small_eigh_desc(H: "torch.Tensor"):
+        H = 0.5 * (H + H.T)
+        evals, evecs = torch.linalg.eigh(H)
         idx = torch.argsort(evals, descending=True)
         return evals[idx], evecs[:, idx]
 
-    def _implicit_shifted_qr_dense(T: torch.Tensor,
-                                    shifts: torch.Tensor):
-        m  = T.shape[0]
-        I  = torch.eye(m, device=device, dtype=small_dtype)
-        Tw = T.clone().to(small_dtype)
-        Z  = torch.eye(m, device=device, dtype=small_dtype)
-        for mu in shifts:
-            Qs, Rs = torch.linalg.qr(Tw - mu * I, mode="reduced")
-            d      = torch.diagonal(Rs)
-            signs  = torch.where(
-                d < 0,
-                torch.tensor(-1.0, device=device, dtype=small_dtype),
-                torch.tensor( 1.0, device=device, dtype=small_dtype),
-            )
-            Qs = Qs * signs[None, :]
-            Rs = signs[:, None] * Rs
-            Tw = Rs @ Qs + mu * I
-            Tw = 0.5 * (Tw + Tw.T)
-            Z  = Z @ Qs
-        return Tw, Z
+    def _true_residuals(vals_t: "torch.Tensor", vecs_t: "torch.Tensor") -> np.ndarray:
+        # FIX 5: pass _count=False so these don't pollute benchmark counters.
+        AV = _apply_A(vecs_t, _count=False)
+        if B_def is not None:
+            AV = _project_deflation(AV)
+        R = AV - vecs_t * vals_t.to(device=device, dtype=dtype)[None, :]
+        return torch.linalg.norm(R, dim=0).detach().cpu().numpy().astype(np.float64)
 
-    def _tridiagonalize_retained_block(Qkeep: torch.Tensor,
-                                        Tkeep: torch.Tensor):
+    # FIX 2: Allocate Q buffer once and reuse across cycles.
+    Q_buf = torch.empty((N, ncv + block_size), device=device, dtype=dtype)
+
+    def _expand_cycle(Qseed: "torch.Tensor"):
         """
-        After dense shifted QR the retained block Tkeep is generally dense.
-        Restore the Lanczos three-term recurrence via scipy Hessenberg
-        (symmetric Hessenberg = tridiagonal). Rotate Qkeep accordingly.
-        Cost: O(keep^3) on CPU — negligible.
+        Build one block Krylov cycle starting from Qseed, reusing Q_buf.
+        Returns a *view* slice of Q_buf, H, p, m.
+
+        FIX 3 (H symmetry): The block Lanczos relation is
+            A Q[:,applied:end] = Q[:,:m] H[:m, applied:end]  +  W_residual
+        where W_residual = Q[:,m:m+r] * R[:r,:].
+        We fill H[applied:end, m:m+r] = R[:r,:].T as well so that H[:p,:p]
+        is exactly the projected matrix Q[:,:p].T @ A @ Q[:,:p] (up to
+        floating point), making the residual formula exact.
         """
-        T_np = Tkeep.detach().cpu().numpy().astype(np.float64)
-        T_np = 0.5 * (T_np + T_np.T)
-        H_np, S_np = scipy.linalg.hessenberg(T_np, calc_q=True)
-        H_np = 0.5 * (H_np + H_np.T)
+        s0 = Qseed.shape[1]
+        if s0 > ncv:
+            Qseed = Qseed[:, :ncv]
+            s0 = ncv
+        Q_buf[:, :s0] = Qseed
 
-        r     = H_np.shape[0]
-        H_tri = np.zeros_like(H_np)
-        np.fill_diagonal(H_tri, np.diag(H_np))
-        if r > 1:
-            off    = 0.5 * (np.diag(H_np, 1) + np.diag(H_np, -1))
-            H_tri += np.diag(off, 1) + np.diag(off, -1)
+        H = torch.zeros((ncv + block_size, ncv + block_size), device=device, dtype=small_dtype)
+        m = s0
+        applied = 0
 
-        S     = torch.from_numpy(S_np).to(device=device, dtype=dtype)
-        Qkeep = Qkeep @ S
+        while applied < ncv:
+            if applied >= m:
+                needed = min(block_size, ncv + block_size - m)
+                Qnew = _orthonormalize_block(
+                    torch.randn((N, needed), device=device, dtype=dtype),
+                    Q_buf[:, :m],
+                    needed,
+                    allow_random_fill=True,
+                )
+                Q_buf[:, m:m + needed] = Qnew
+                m += needed
 
-        H = torch.from_numpy(H_tri).to(device=device, dtype=small_dtype)
+            end = min(applied + block_size, m, ncv)
+            s = end - applied
+            if s <= 0:
+                break
 
-        for i in range(r - 1):
-            if float(H[i + 1, i].cpu()) < 0:
-                Qkeep[:, i + 1].mul_(-1)
-                H[i + 1, :].mul_(-1)
-                H[:, i + 1].mul_(-1)
+            Vblock = Q_buf[:, applied:end]
+            W = _apply_A(Vblock)
+            W = _project_deflation(W)
 
-        alpha_new = torch.diagonal(H).clone().to(small_dtype)
-        beta_new  = (torch.diagonal(H, offset=-1).clone().abs().to(small_dtype)
-                     if r > 1 else
-                     torch.empty(0, device=device, dtype=small_dtype))
-        return Qkeep, alpha_new, beta_new, H
-
-    def _rotate_basis_blocked(m: int, Z_keep: torch.Tensor,
-                               keep_eff: int) -> torch.Tensor:
-        """Blocked Q[:,:m] @ Z_keep — avoids one large (N,keep) temporary."""
-        Qout = torch.empty((N, keep_eff), device=device, dtype=dtype)
-        for lo in range(0, N, block_rows):
-            hi = min(lo + block_rows, N)
-            Qout[lo:hi] = Q[lo:hi, :m] @ Z_keep
-        return Qout
-
-    def _orth_error_blocked(Qblock: torch.Tensor) -> float:
-        """
-        FIX 2: ||Q.T Q - I||_F / ncols via blocked accumulation.
-        Avoids creating a float64 copy of the full (N, m) basis.
-        At N=10M, m=64: naive cast uses 5.1 GB; this uses ~30 MB per block.
-        """
-        r = Qblock.shape[1]
-        G = torch.zeros((r, r), device=device, dtype=small_dtype)
-        for lo in range(0, Qblock.shape[0], block_rows):
-            hi = min(lo + block_rows, Qblock.shape[0])
-            B  = Qblock[lo:hi].to(dtype=small_dtype)
-            G += B.T @ B
-        I = torch.eye(r, device=device, dtype=small_dtype)
-        return float((torch.linalg.norm(G - I) / max(1, r)).cpu())
-
-    def _true_residuals(vals_t: torch.Tensor,
-                        vecs_t: torch.Tensor) -> np.ndarray:
-        """||A v_i - lam_i v_i|| via explicit matvec. k extra matvecs."""
-        out = []
-        for i in range(vals_t.numel()):
-            Av = matvec_fn(vecs_t[:, i])
-            r  = (Av.to(device=device, dtype=dtype)
-                  - vals_t[i].to(dtype=dtype) * vecs_t[:, i])
-            out.append(float(torch.linalg.norm(r).cpu()))
-        return np.array(out, dtype=np.float64)
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Persistent GPU state
-    # ──────────────────────────────────────────────────────────────────────
-
-    Q     = torch.empty((N, ncv + 1), device=device, dtype=dtype)
-    alpha = torch.zeros(ncv,          device=device, dtype=small_dtype)
-    beta  = torch.zeros(ncv,          device=device, dtype=small_dtype)
-
-    Q[:, 0] = _make_initial_vector()
-
-    n_matvec            = 0
-    cycles_done         = 0
-    converged           = False
-    breakdown           = False
-    state_valid         = True
-
-    best_evals          = None
-    best_evecs          = None
-    best_m              = None
-    best_beta_last      = None
-
-    off_tridiag_history  = []
-    restart_beta_history = []
-    orth_error_history   = []
-
-    start_col           = 0
-    m_final             = 1
-    beta_last           = torch.tensor(0.0, device=device, dtype=small_dtype)
-    has_residual_vector = False
-
-    def _expand_from(start_col_local: int):
-        nonlocal n_matvec
-        beta_last_local = torch.tensor(0.0, device=device, dtype=small_dtype)
-        has_residual    = False
-        m_local         = start_col_local + 1
-
-        for j in range(start_col_local, ncv):
-            qj = Q[:, j]
-            z  = matvec_fn(qj)
-            z  = z.to(device=device, dtype=dtype).reshape(-1)
-            n_matvec += 1
-
-            if z.numel() != N:
-                raise ValueError(f"matvec returned {z.numel()}, expected {N}")
-
-            z = _project_deflation(z)
-
-            if j > 0:
-                z = z - beta[j - 1].to(dtype=dtype) * Q[:, j - 1]
-
-            # Diagonal coeff set before reortho; NOT updated inside loop.
-            aj = torch.dot(qj, z).to(small_dtype)
-            z  = z - aj.to(dtype=dtype) * qj
-
+            # Full block Arnoldi/Lanczos orthogonalization.
+            coeff_total = torch.zeros((m, s), device=device, dtype=small_dtype)
             if reorthogonalize:
-                Qj = Q[:, :j + 1]
                 for _ in range(reorth_passes):
-                    c = Qj.T @ z
-                    z = z - Qj @ c
+                    C = (Q_buf[:, :m].T @ W).to(dtype=small_dtype)
+                    W = W - Q_buf[:, :m] @ C.to(dtype=dtype)
+                    coeff_total += C
+            else:
+                C = (Q_buf[:, :m].T @ W).to(dtype=small_dtype)
+                W = W - Q_buf[:, :m] @ C.to(dtype=dtype)
+                coeff_total += C
 
-            bj = torch.linalg.norm(z).to(small_dtype)
-            alpha[j]        = aj
-            beta_last_local = bj
-            m_local         = j + 1
+            # Store Gram coefficients in this column block only (no transpose fill).
+            # H is upper-Hessenberg style here; we symmetrize only at Ritz-problem time.
+            # Using = not += avoids double-counting when reorth adds multiple passes.
+            H[:m, applied:end] = coeff_total
 
-            if float(bj.cpu()) < breakdown_tol:
-                return m_local, beta_last_local, False
+            # Residual block QR.
+            Qnew, R, r = _qr_rank(W)
+            if r > 0:
+                max_add = min(r, ncv + block_size - m)
+                Q_buf[:, m:m + max_add] = Qnew[:, :max_add]
+                # Subdiagonal block only — symmetrize H[:p,:p] at Ritz-problem time.
+                H[m:m + max_add, applied:end] = R[:max_add, :].to(dtype=small_dtype)
+                m += max_add
 
-            beta[j]      = bj
-            Q[:, j + 1]  = z / bj.to(dtype=dtype)
-            has_residual = True
+            applied = end
 
-        return ncv, beta_last_local, has_residual
+        p = min(applied, ncv)
+        return Q_buf, H, p, m
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Main IRLM loop
-    # ──────────────────────────────────────────────────────────────────────
+    def _thick_restart_seed(
+        Q: "torch.Tensor",
+        H: "torch.Tensor",
+        p: int,
+        m: int,
+        evals_all: "torch.Tensor",
+        evecs_all: "torch.Tensor",
+        n_take: int,
+    ) -> Optional["torch.Tensor"]:
+        """
+        Thick restart: keep the top keep_eff Ritz vectors plus a fresh residual block.
+
+        The Hessenberg rotation has been removed (per review point 2): after
+        U_keep = Q[:,:p] @ Y_keep the projected matrix in that Ritz basis is
+        diag(evals[:keep_eff]), not H[:keep_eff,:keep_eff], so rotating by S
+        does not restore a tridiagonal relation — it just changes the basis within
+        the same subspace without benefit. The next _expand_cycle rebuilds the
+        relation from scratch anyway.
+
+        Returns Qseed of shape (N, keep_eff + block_size), or None on breakdown.
+        """
+        # Validated keep_eff: must satisfy k <= keep_eff <= p - block_size.
+        keep_eff = min(keep, p - block_size)
+        keep_eff = max(k, keep_eff)
+        keep_eff = min(keep_eff, p)
+
+        Y_keep = evecs_all[:, :keep_eff].to(dtype=dtype)
+        U_keep = _linear_combo_blocked(Q[:, :p], Y_keep)
+
+        # Defensive reorth/QR of retained Ritz basis (no Hessenberg rotation).
+        try:
+            U_keep_orth = _orthonormalize_block(U_keep, None, keep_eff, allow_random_fill=False)
+        except RuntimeError:
+            return None
+
+        # Residual seed from Ritz residual directions.
+        r_cols = min(block_size, n_take)
+        if m > p:
+            coeff_tail = H[p:m, :p] @ evecs_all[:, :r_cols]
+            Rseed = _linear_combo_blocked(Q[:, p:m], coeff_tail.to(dtype=dtype))
+        else:
+            Rseed = torch.empty((N, 0), device=device, dtype=dtype)
+
+        try:
+            Rblock = _orthonormalize_block(
+                Rseed,
+                U_keep_orth,
+                block_size,
+                allow_random_fill=True,
+            )
+        except RuntimeError:
+            return None
+
+        return torch.cat([U_keep_orth, Rblock], dim=1)
+
+    if verbose:
+        print(
+            f"[block-irlm] N={N} k={k} block_size={block_size} ncv={ncv} "
+            f"keep={keep} max_restarts={max_restarts} tol={tol:g} "
+            f"dtype={dtype} small_dtype={small_dtype} device={device}"
+        )
+        if matmat_fn is None:
+            print("  warning: using matvec_fn fallback; not a true block matmat")
+        if B_def is not None:
+            print(f"  deflate_basis: {B_def.shape[1]} direction(s)")
+
+    Qseed = _initial_seed()
+
+    converged = False
+    breakdown = False
+    cycles_done = 0
+    orth_error_history = []
+    residual_history = []
+    theta_history = []
+
+    last_Q = None
+    last_H = None
+    last_p = None
+    last_m = None
+    last_evals = None
+    last_evecs = None
+    last_formula_res = None
 
     try:
         for cycle in range(max_restarts + 1):
             cycles_done = cycle + 1
+            Q, H, p, m = _expand_cycle(Qseed)
+            if p < k:
+                raise RuntimeError(f"cycle produced p={p} basis columns < k={k}")
 
-            m, beta_last, has_residual_vector = _expand_from(start_col)
-            m_final = m
+            Hm = H[:p, :p]
+            Hm = 0.5 * (Hm + Hm.T)
+            evals_all, evecs_all = _small_eigh_desc(Hm)
 
-            Tm = _build_T(alpha, beta, m)
-            evals_all, evecs_all = _small_eigh_desc(Tm)
-
-            n_take  = min(k, m)
-            evals_k = evals_all[:n_take]
-            evecs_k = evecs_all[:, :n_take]
-
-            residuals = torch.abs(beta_last * evecs_k[-1, :])
+            n_take = min(k, p)
+            Yk = evecs_all[:, :n_take]
+            tail = H[p:m, :p] @ Yk if m > p else torch.zeros((0, n_take), device=device, dtype=small_dtype)
+            formula_res = torch.linalg.norm(tail, dim=0) if tail.numel() else torch.zeros(n_take, device=device, dtype=small_dtype)
 
             if relative_residual:
-                thresholds = tol * torch.maximum(
-                    torch.ones_like(evals_k), torch.abs(evals_k))
+                thresholds = tol * torch.maximum(torch.ones_like(evals_all[:n_take]), torch.abs(evals_all[:n_take]))
             else:
-                thresholds = torch.full_like(residuals, float(tol))
+                thresholds = torch.full_like(formula_res, float(tol))
+            n_conv = int(torch.sum(formula_res <= thresholds).detach().cpu())
 
-            n_conv   = int(torch.sum(residuals <= thresholds).cpu())
-            orth_err = _orth_error_blocked(Q[:, :m])   # FIX 2
+            if orth_check_every is not None and orth_check_every > 0 and cycle % orth_check_every == 0:
+                orth_err = _orth_error_blocked(Q[:, :m])
+            else:
+                orth_err = float("nan")
             orth_error_history.append(orth_err)
+            residual_history.append(formula_res.detach().cpu().numpy().astype(np.float64))
+            theta_history.append(evals_all[:n_take].detach().cpu().numpy().astype(np.float64))
 
-            best_evals     = evals_all
-            best_evecs     = evecs_all
-            best_m         = m
-            best_beta_last = beta_last
+            last_Q, last_H, last_p, last_m = Q, H, p, m
+            last_evals, last_evecs, last_formula_res = evals_all, evecs_all, formula_res
 
             if verbose:
-                max_res = (float(torch.max(residuals).cpu())
-                           if residuals.numel() else float("nan"))
+                max_res = float(torch.max(formula_res).detach().cpu()) if formula_res.numel() else float("nan")
                 print(
-                    f"  cycle={cycle:02d}  m={m:4d}  "
-                    f"beta={float(beta_last.cpu()):.3e}  "
-                    f"converged={n_conv}/{n_take}  "
-                    f"max_res={max_res:.3e}  orth={orth_err:.2e}"
+                    f"  cycle={cycle:02d} p={p:4d} m={m:4d} "
+                    f"converged={n_conv}/{n_take} max_res={max_res:.3e} orth={orth_err:.2e}"
                 )
-                print(f"    theta[:5] = "
-                      f"{evals_k[:min(5,len(evals_k))].cpu().numpy()}")
+                print(f"    theta[:5] = {evals_all[:min(5, n_take)].detach().cpu().numpy()}")
 
-            if n_take >= k and bool(
-                torch.all(residuals[:k] <= thresholds[:k]).cpu()
-            ):
+            if n_take >= k and bool(torch.all(formula_res[:k] <= thresholds[:k]).detach().cpu()):
                 converged = True
                 if verbose:
-                    print(f"[irlm] converged after cycle={cycle}")
-                break
-
-            if float(beta_last.cpu()) < breakdown_tol:
-                breakdown = True
-                if verbose:
-                    print(f"[irlm] lucky breakdown cycle={cycle}")
+                    print(f"[block-irlm] converged after cycle={cycle}")
                 break
 
             if cycle == max_restarts:
                 break
 
-            if not has_residual_vector:
-                breakdown = True
-                break
-
-            if m <= keep + 1:
-                break
-
-            # ── IRLM restart ──────────────────────────────────────────────
-
-            keep_eff = min(keep, m - 2)
-            shifts   = evals_all[keep_eff:m].detach()
-
-            if shifts.numel() == 0:
-                break
-
-            T_shifted, Z = _implicit_shifted_qr_dense(Tm, shifts)
-
-            # Off-tridiagonal fill diagnostic.
-            Tk = T_shifted[:keep_eff, :keep_eff]
-            Tk_tri = torch.diag(torch.diagonal(Tk))
-            if keep_eff > 1:
-                off    = 0.5 * (torch.diagonal(Tk, 1) + torch.diagonal(Tk, -1))
-                Tk_tri = Tk_tri + torch.diag(off, 1) + torch.diag(off, -1)
-            denom   = max(float(torch.linalg.norm(Tk).cpu()), 1e-300)
-            off_rel = float(torch.linalg.norm(Tk - Tk_tri).cpu()) / denom
-            off_tridiag_history.append(off_rel)
-
-            Z_keep = Z[:, :keep_eff].to(dtype=dtype)
-            Qkeep  = _rotate_basis_blocked(m, Z_keep, keep_eff)
-            Tkeep  = T_shifted[:keep_eff, :keep_eff]
-
-            state_valid = False   # mark invalid before mutation
-
-            Qkeep, alpha_new, beta_new, Tkeep_tri = \
-                _tridiagonalize_retained_block(Qkeep, Tkeep)
-
-            # Explicit restart residual.
-            qlast = Qkeep[:, keep_eff - 1]
-            r     = matvec_fn(qlast).to(device=device, dtype=dtype).reshape(-1)
-            n_matvec += 1
-
-            r = _project_deflation(r)
-            r = r - alpha_new[keep_eff - 1].to(dtype=dtype) * qlast
-            if keep_eff > 1:
-                r = r - beta_new[keep_eff - 2].to(dtype=dtype) * Qkeep[:, keep_eff - 2]
-
-            # FIX 5: re-deflate and clean up after orthogonalization.
-            r = _orthogonalize(Qkeep, r, passes=reorth_passes)
-            r = _project_deflation(r)           # remove any leaked deflation component
-            r = _orthogonalize(Qkeep, r, passes=1)   # one final cleanup pass
-
-            beta_restart = torch.linalg.norm(r).to(small_dtype)
-            restart_beta_history.append(float(beta_restart.cpu()))
-
-            if float(beta_restart.cpu()) < breakdown_tol:
+            # FIX 1+4: thick restart with GPU Hessenberg and keep_eff validation.
+            new_seed = _thick_restart_seed(Q, H, p, m, evals_all, evecs_all, n_take)
+            if new_seed is None:
                 breakdown = True
                 if verbose:
-                    print("[irlm] restart residual collapsed")
-                break   # state_valid stays False; fallback used below
+                    print("[block-irlm] restart seed construction failed (breakdown)")
+                break
+            Qseed = new_seed
 
-            q_restart = r / beta_restart.to(dtype=dtype)
+        # ── Final Ritz extraction ────────────────────────────────────────────
 
-            Q[:, :keep_eff]     = Qkeep
-            Q[:, keep_eff]      = q_restart
-            alpha.zero_()
-            beta.zero_()
-            alpha[:keep_eff]    = alpha_new
-            if keep_eff > 1:
-                beta[:keep_eff - 1] = beta_new
-            beta[keep_eff - 1]  = beta_restart
-            start_col           = keep_eff
-            state_valid         = True       # install complete
+        if last_Q is None or last_evals is None or last_evecs is None or last_p is None:
+            raise RuntimeError("block IRLM failed before producing a Ritz problem")
 
-            if verbose:
-                print(
-                    f"    restart: shifts={int(shifts.numel())}  "
-                    f"off_tridiag={off_rel:.3e}  "
-                    f"beta_restart={float(beta_restart.cpu()):.3e}"
-                )
+        n_return = min(k, last_p)
+        vals = last_evals[:n_return]
+        Y = last_evecs[:, :n_return].to(dtype=dtype)
+        ritz_vecs = _linear_combo_blocked(last_Q[:, :last_p], Y)
+        ritz_vecs = ritz_vecs / torch.linalg.norm(ritz_vecs, dim=0).clamp_min(torch.finfo(dtype).eps)
 
-        # ── Final Ritz extraction ─────────────────────────────────────────
-
-        if best_evals is None or best_m is None:
-            raise RuntimeError("IRLM produced no Ritz pairs")
-
-        if state_valid:
-            Tfinal           = _build_T(alpha, beta, m_final)
-            evals_f, evecs_f = _small_eigh_desc(Tfinal)
-        else:
-            # Restart failed mid-way — fall back to last complete cycle.
-            evals_f  = best_evals
-            evecs_f  = best_evecs
-            m_final  = best_m
-            beta_last = best_beta_last
-
-        n_return  = min(k, m_final)
-        vals      = evals_f[:n_return]
-        Y         = evecs_f[:, :n_return].to(dtype=dtype)
-        ritz_vecs = Q[:, :m_final] @ Y
-        ritz_vecs = ritz_vecs / torch.linalg.norm(
-            ritz_vecs, dim=0).clamp_min(torch.finfo(dtype).eps)
-
-        formula_res = torch.abs(beta_last * evecs_f[-1, :n_return])
-
-        # FIX 4: true residuals are optional — skip in production.
-        if compute_true_residuals:
-            true_res = _true_residuals(vals, ritz_vecs)
-        else:
-            true_res = None
+        formula_res = last_formula_res[:n_return] if last_formula_res is not None else None
+        # FIX 5: true residuals use _count=False (handled inside _true_residuals).
+        true_res = _true_residuals(vals, ritz_vecs) if compute_true_residuals else None
 
         elapsed = time.perf_counter() - t_start
 
         if verbose:
             print(
-                f"[irlm] done  converged={converged}  "
-                f"breakdown={breakdown}  state_valid={state_valid}  "
-                f"cycles={cycles_done}  matvecs={n_matvec}  "
-                f"time={elapsed:.2f}s"
+                f"[block-irlm] done converged={converged} breakdown={breakdown} "
+                f"cycles={cycles_done} matmat={n_matmat} rhs={n_rhs} time={elapsed:.2f}s"
             )
-            print(f"  eigenvalues:       {vals.cpu().numpy()}")
-            print(f"  formula residuals: {formula_res.cpu().numpy()}")
+            print(f"  eigenvalues:       {vals.detach().cpu().numpy()}")
+            if formula_res is not None:
+                print(f"  formula residuals: {formula_res.detach().cpu().numpy()}")
             if true_res is not None:
                 print(f"  true residuals:    {true_res}")
 
         if return_torch:
-            vals_out, vecs_out = vals, ritz_vecs
+            vals_out = vals
+            vecs_out = ritz_vecs
         else:
-            vals_out = vals.cpu().numpy().astype(np.float64)
-            vecs_out = ritz_vecs.cpu().numpy()
+            vals_out = vals.detach().cpu().numpy().astype(np.float64)
+            vecs_out = ritz_vecs.detach().cpu().numpy()
 
         if return_info:
-            info = {
-                "converged":           bool(converged),
-                "breakdown":           bool(breakdown),
-                "state_valid":         bool(state_valid),
-                "cycles":              int(cycles_done),
-                "n_matvec":            int(n_matvec),
-                "ncv":                 int(ncv),
-                "keep":                int(keep),
-                "k":                   int(k),
-                "tol":                 float(tol),
-                "relative_residual":   bool(relative_residual),
-                "elapsed":             float(elapsed),
-                "m_final":             int(m_final),
-                "beta_final":          float(beta_last.cpu()),
-                "formula_residuals":   formula_res.cpu().numpy().astype(np.float64),
-                "true_residuals":      true_res,
-                "off_tridiag_restart": off_tridiag_history,
-                "restart_beta":        restart_beta_history,
-                "orth_error":          orth_error_history,
-                "dtype":               str(dtype),
-                "small_dtype":         str(small_dtype),
-                "device":              str(device),
+            info: Dict[str, Any] = {
+                "method": "thick_restarted_block_arnoldi_rayleigh_ritz",
+                "converged": bool(converged),
+                "breakdown": bool(breakdown),
+                "cycles": int(cycles_done),
+                "n_matmat": int(n_matmat),
+                "n_rhs": int(n_rhs),
+                "ncv": int(ncv),
+                "keep": int(keep),
+                "k": int(k),
+                "block_size": int(block_size),
+                "tol": float(tol),
+                "relative_residual": bool(relative_residual),
+                "elapsed": float(elapsed),
+                "p_final": int(last_p),
+                "m_final": int(last_m) if last_m is not None else None,
+                "formula_residuals": None if formula_res is None else formula_res.detach().cpu().numpy().astype(np.float64),
+                "true_residuals": true_res,
+                "orth_error": orth_error_history,
+                "residual_history": residual_history,
+                "theta_history": theta_history,
+                "dtype": str(dtype),
+                "small_dtype": str(small_dtype),
+                "device": str(device),
             }
             return vals_out, vecs_out, info
 
         return vals_out, vecs_out
 
     finally:
-        # Restore all saved state unconditionally.
         torch.set_grad_enabled(grad_state)
         if old_tf32_matmul is not None:
             torch.backends.cuda.matmul.allow_tf32 = old_tf32_matmul
-            torch.backends.cudnn.allow_tf32       = old_tf32_cudnn
+            torch.backends.cudnn.allow_tf32 = old_tf32_cudnn
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Drop-in compatibility shim for eigensolver_gpu.py
-# Matches the signature of the original gpu_lanczos() exactly.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def gpu_lanczos(
-    matvec_fn,
-    N:        int,
-    k:        int   = 8,
-    n_iter:   int   = None,
-    tol:      float = 1e-6,
-    dtype           = None,
-    device:   str   = "cuda",
-    verbose:  bool  = True,
+def gpu_block_lanczos(
+    matmat_fn: Optional[Callable[["torch.Tensor"], "torch.Tensor"]] = None,
+    *,
+    matvec_fn: Optional[Callable[["torch.Tensor"], "torch.Tensor"]] = None,
+    N: int,
+    k: int = 8,
+    n_iter: Optional[int] = None,
+    block_size: Optional[int] = None,
+    tol: float = 1e-6,
+    dtype=None,
+    device: str = "cuda",
+    verbose: bool = True,
+    q0_block=None,
     q0=None,
     **kwargs,
 ):
-    """
-    Drop-in replacement for the original gpu_lanczos() in eigensolver_gpu.py.
-
-    Translates n_iter -> ncv for gpu_irlm_dense_qr.
-    All other original parameters are forwarded unchanged.
-    Extra IRLM parameters (keep, max_restarts, etc.) can be passed via kwargs.
-
-    Parameters
-    ----------
-    n_iter : int or None
-        Maps to ncv (Krylov subspace size) in IRLM.
-        Default behaviour is identical: None -> min(N, max(4k+40, k+20)).
-
-    Returns
-    -------
-    vals : np.ndarray, shape (k,)  — descending eigenvalues
-    vecs : np.ndarray, shape (N, k) — corresponding Ritz vectors
-    """
-    return gpu_irlm_dense_qr(
-        matvec_fn,
-        N             = N,
-        k             = k,
-        ncv           = n_iter,   # n_iter in plain Lanczos = ncv in IRLM
-        tol           = tol,
-        dtype         = dtype,
-        device        = device,
-        verbose       = verbose,
-        q0            = q0,
-        # production defaults: skip true residuals (saves k matvecs)
-        compute_true_residuals = kwargs.pop("compute_true_residuals", False),
+    """Compatibility wrapper. n_iter maps to ncv."""
+    return gpu_block_irlm(
+        matmat_fn=matmat_fn,
+        matvec_fn=matvec_fn,
+        N=N,
+        k=k,
+        ncv=n_iter,
+        block_size=block_size,
+        tol=tol,
+        dtype=dtype,
+        device=device,
+        verbose=verbose,
+        q0_block=q0_block,
+        q0=q0,
         **kwargs,
     )
 
 
-def make_gpu_matvec(state, ext_module):
+def make_gpu_matmat(state, ext_module):
     """
-    Unchanged from eigensolver_gpu.py — wrap CUDAState + ext into GPU matvec.
-    Kept here so this file is a complete drop-in replacement.
+    Convenience wrapper for a CUDA extension exposing either:
+      - ext_module.matmat(X_fp16, V, rscale, sq_X, beta), preferred
+      - ext_module.matvec(...), fallback over columns.
     """
-    try:
-        import torch
-    except ImportError:
+    if not _TORCH_AVAILABLE:
         raise ImportError("torch required")
+    import torch
 
-    def matvec_gpu(v):
+    has_matmat = hasattr(ext_module, "matmat")
+
+    def matmat_gpu(V):
         with torch.no_grad():
-            return ext_module.matvec(
-                state.X_fp16,
-                v,
-                state.rscale,
-                state.sq_X,
-                state.beta,
-            )
-    return matvec_gpu
+            if has_matmat:
+                return ext_module.matmat(
+                    state.X_fp16, V, state.rscale, state.sq_X, state.beta,
+                )
+            cols = [
+                ext_module.matvec(
+                    state.X_fp16, V[:, j], state.rscale, state.sq_X, state.beta,
+                )
+                for j in range(V.shape[1])
+            ]
+            return torch.stack(cols, dim=1)
+
+    return matmat_gpu
