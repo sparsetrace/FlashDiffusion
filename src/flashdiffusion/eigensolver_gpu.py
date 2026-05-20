@@ -758,3 +758,4 @@ def make_gpu_matmat(state, ext_module):
     return matmat_gpu
 
 gpu_lanczos = gpu_block_lanczos
+make_gpu_matvec = make_gpu_matmat
