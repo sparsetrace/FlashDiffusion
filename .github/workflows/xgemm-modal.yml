@@ -1,0 +1,37 @@
+# .github/workflows/xgemm-modal.yml
+name: xgemm SM80 GPU tests (Modal)
+
+"on":
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: 'Modal GPU (both run the same sm_80 CUDA binary)'
+        type: choice
+        required: true
+        default: A10G
+        options:
+          - A10G
+          - A100
+
+permissions:
+  contents: read
+
+jobs:
+  gpu-tests:
+    name: pytest on Modal SM80 / ${{ inputs.gpu || 'A10G' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Modal CLI
+        run: python -m pip install --upgrade modal
+      - name: Run xgemm CUDA / JAX FFI pytest suite on Modal
+        run: modal run ci/modal_xgemm.py --gpu "${{ inputs.gpu || 'A10G' }}"
