@@ -1,0 +1,18 @@
+{
+  "file_count": 32,
+  "source_lines": 10316,
+  "source_bytes": 364346,
+  "source_tokens_estimate": 104099,
+  "context_md_lines": 10514,
+  "context_md_bytes": 367341,
+  "context_md_tokens_estimate": 104955,
+  "token_estimate_method": "UTF-8 bytes / 3.5; approximate, not a tokenizer",
+  "files_by_extension": {
+    ".cu": 7,
+    ".md": 1,
+    ".py": 21,
+    ".toml": 1,
+    ".yml": 1,
+    "[none]": 1
+  }
+}
